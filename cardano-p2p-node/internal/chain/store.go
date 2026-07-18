@@ -92,17 +92,41 @@ func (s *Store) CurrentSlot() uint64 {
 	return s.tip.SlotNo
 }
 
-// Rollback truncates the header ring to the given point and notifies
-// all downstream ChainSync servers so they can issue MsgRollBackward.
+// Rollback truncates the header ring to the given exact point (slot + hash)
+// and cleans the block cache of entries beyond that point.
+// All downstream ChainSync servers are notified so they issue MsgRollBackward.
 func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) {
 	s.mu.Lock()
+
+	// Keep only headers that precede the rollback point.
+	// Headers AT the exact rollback point are also kept (inclusive).
+	// Headers at the same slot but a different hash (orphan fork) are dropped.
 	newHeaders := s.headers[:0]
 	for _, h := range s.headers {
-		if h.Point.SlotNo <= pt.SlotNo {
+		if h.Point.SlotNo < pt.SlotNo {
+			newHeaders = append(newHeaders, h)
+			continue
+		}
+		if h.Point.SlotNo == pt.SlotNo && hashKey(h.Point.Hash) == hashKey(pt.Hash) {
 			newHeaders = append(newHeaders, h)
 		}
+		// Headers past the rollback slot (or at the same slot with wrong hash)
+		// are rolled back; stop here.
+		break
 	}
 	s.headers = newHeaders
+
+	// Clean block bodies for headers that were rolled back.
+	keepHashes := make(map[string]bool, len(newHeaders))
+	for _, h := range newHeaders {
+		keepHashes[hashKey(h.Point.Hash)] = true
+	}
+	for k := range s.blocks {
+		if !keepHashes[k] {
+			delete(s.blocks, k)
+		}
+	}
+
 	if pt.IsOrigin() {
 		s.tip = Point{}
 		s.tipBlock = 0

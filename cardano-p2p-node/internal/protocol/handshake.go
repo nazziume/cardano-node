@@ -2,7 +2,6 @@
 package protocol
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 
@@ -222,13 +221,3 @@ func readOneMessage(r io.Reader) ([]byte, error) {
 	return raw, nil
 }
 
-// readOneMessageBuf reads one CBOR message from a buffer.
-// This is kept for potential future use.
-func readOneMessageBuf(data []byte) (msg []byte, err error) {
-	dec := cbor.NewDecoder(bytes.NewReader(data))
-	var raw cbor.RawMessage
-	if decErr := dec.Decode(&raw); decErr != nil {
-		return nil, decErr
-	}
-	return raw, nil
-}

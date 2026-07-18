@@ -58,10 +58,12 @@ type Conn struct {
 
 	writeMu sync.Mutex
 
-	// incoming data buffers keyed by protocolID
-	// Each protocol gets its own assembler buffer
-	incomingMu sync.Mutex
-	incoming   map[uint16]*protoBuf
+	// incoming data buffers keyed by protocolID.
+	// incomingClosed is set to true when the connection closes; any buffer
+	// created after that is immediately marked done so readers unblock.
+	incomingMu     sync.Mutex
+	incoming       map[uint16]*protoBuf
+	incomingClosed bool
 }
 
 type protoBuf struct {
@@ -122,6 +124,8 @@ func (c *Conn) Underlying() net.Conn {
 }
 
 // getOrCreateBuf returns the incoming buffer for a given protocol.
+// If the connection has already been closed, the new buffer is immediately
+// marked done so that any reader unblocks at once.
 func (c *Conn) getOrCreateBuf(protoID uint16) *protoBuf {
 	c.incomingMu.Lock()
 	defer c.incomingMu.Unlock()
@@ -129,6 +133,9 @@ func (c *Conn) getOrCreateBuf(protoID uint16) *protoBuf {
 		return pb
 	}
 	pb := newProtoBuf()
+	if c.incomingClosed {
+		pb.close()
+	}
 	c.incoming[protoID] = pb
 	return pb
 }
@@ -148,19 +155,16 @@ func (c *Conn) ReadLoop() error {
 			return fmt.Errorf("mux read header: %w", err)
 		}
 
-		_ = binary.BigEndian.Uint32(header[0:4]) // timestamp (we don't use it)
+		_ = binary.BigEndian.Uint32(header[0:4]) // timestamp (not used)
 		modeProto := binary.BigEndian.Uint16(header[4:6])
 		length := binary.BigEndian.Uint16(header[6:8])
 		protoID := modeProto & 0x7FFF
 		isResp := (modeProto & 0x8000) != 0
 
-		// Validate direction: we should only receive from the other side
-		// isInitiator=true → we receive from responder (isResp=true)
-		// isInitiator=false → we receive from initiator (isResp=false)
-		if c.isInitiator != !isResp {
-			// Direction mismatch – skip payload but don't error;
-			// some versions send keepalive from both sides
-		}
+		// Each side should only receive segments from the OTHER side.
+		// Initiator expects isResp=1 (from responder); responder expects isResp=0.
+		wantResp := c.isInitiator // initiator wants responder segments (isResp=1)
+		wrongDir := (isResp != wantResp)
 
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(c.conn, payload); err != nil {
@@ -168,7 +172,13 @@ func (c *Conn) ReadLoop() error {
 			return fmt.Errorf("mux read payload (proto=%d len=%d): %w", protoID, length, err)
 		}
 
-		_ = isResp
+		if wrongDir {
+			// Discard segments arriving from our own direction — we never send
+			// to ourselves, so this indicates a framing error or stale data.
+			// Drop silently rather than corrupting a protocol's read buffer.
+			continue
+		}
+
 		buf := c.getOrCreateBuf(protoID)
 		buf.write(payload)
 	}
@@ -177,6 +187,7 @@ func (c *Conn) ReadLoop() error {
 func (c *Conn) closeAllBufs() {
 	c.incomingMu.Lock()
 	defer c.incomingMu.Unlock()
+	c.incomingClosed = true // future getOrCreateBuf calls will close new bufs immediately
 	for _, pb := range c.incoming {
 		pb.close()
 	}

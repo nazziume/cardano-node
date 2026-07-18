@@ -27,6 +27,9 @@ const (
 // We provide our transactions to their server (they pull from us).
 //
 // Flow: we send MsgInit, then they pull our txids/txs.
+//
+// Tracking uses a per-peer SET of already-announced txids rather than an
+// integer index. This is robust to RemoveConfirmed() compacting mempool.order.
 func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoTxSubmission)
 
@@ -36,9 +39,11 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 		return fmt.Errorf("txsubmission outbound init: %w", err)
 	}
 
-	// Track what we've acknowledged and what index we're at
-	idx := 0
-	acked := 0
+	// announced: txids this peer has been told about (acknowledged or pending ack).
+	// We never re-announce a txid to the same peer.
+	announced := make(map[string]struct{})
+	// pendingAck: txids announced but not yet acknowledged, in FIFO order.
+	var pendingAck []string
 
 	for {
 		select {
@@ -69,7 +74,7 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 
 		switch tag {
 		case tsTagRequestTxIds:
-			// MsgRequestTxIds = [0, ack, req, blocking]
+			// MsgRequestTxIds = [0, blocking, ack, req]
 			if len(msg) < 4 {
 				continue
 			}
@@ -79,56 +84,79 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 			_ = cbor.Unmarshal(msg[2], &ackCount)
 			_ = cbor.Unmarshal(msg[3], &reqCount)
 
-			// Update acknowledged index
-			acked += int(ackCount)
-			idx = acked
+			// Remove acknowledged txids from our pending list.
+			// They can now be dropped from our tracking.
+			n := int(ackCount)
+			if n > len(pendingAck) {
+				n = len(pendingAck)
+			}
+			for _, key := range pendingAck[:n] {
+				delete(announced, key)
+			}
+			pendingAck = pendingAck[n:]
 
-			// Get available txids
-			entries, newIdx := pool.TxIDsAfter(idx, int(reqCount))
-			idx = newIdx
-
-		if len(entries) == 0 {
-			// No new txs yet. If the peer sent a blocking request, wait for
-			// a new tx to arrive (or done). For non-blocking, reply empty.
-			if blocking {
-				newTxCh := pool.Subscribe()
-				select {
-				case <-done:
-					pool.Unsubscribe(newTxCh)
-					return nil
-				case <-newTxCh:
-					pool.Unsubscribe(newTxCh)
-					entries, newIdx = pool.TxIDsAfter(idx, int(reqCount))
-					idx = newIdx
-				}
-			} else {
-				// Non-blocking + empty: throttle to avoid tight loop.
-				// The remote server will send another request shortly.
-				select {
-				case <-done:
-					return nil
-				case <-time.After(200 * time.Millisecond):
+			// Find txids that are currently in the pool but not yet announced.
+			all := pool.GetAll()
+			var toAnnounce []*mempool.TxEntry
+			for _, e := range all {
+				key := e.ID.String()
+				if _, seen := announced[key]; !seen {
+					toAnnounce = append(toAnnounce, e)
+					if len(toAnnounce) >= int(reqCount) {
+						break
+					}
 				}
 			}
-		}
 
-		// Encode txids and sizes: [[txid, size], ...]
-		txidsAndSizes := make([]interface{}, 0, len(entries))
-		for _, e := range entries {
-			txidsAndSizes = append(txidsAndSizes, []interface{}{[]byte(e.ID), e.Size})
-		}
+			if len(toAnnounce) == 0 {
+				if blocking {
+					newTxCh := pool.Subscribe()
+					select {
+					case <-done:
+						pool.Unsubscribe(newTxCh)
+						return nil
+					case <-newTxCh:
+						pool.Unsubscribe(newTxCh)
+						// Re-scan after new tx arrived
+						all = pool.GetAll()
+						for _, e := range all {
+							key := e.ID.String()
+							if _, seen := announced[key]; !seen {
+								toAnnounce = append(toAnnounce, e)
+								if len(toAnnounce) >= int(reqCount) {
+									break
+								}
+							}
+						}
+					}
+				} else {
+					select {
+					case <-done:
+						return nil
+					case <-time.After(200 * time.Millisecond):
+					}
+				}
+			}
 
-		if len(entries) > 0 {
-			log.Info("txsubmission outbound: advertising txids to peer",
-				zap.Int("count", len(entries)),
-				zap.String("first_txid", entries[0].ID.String()[:16]+"..."))
-		}
+			// Build reply and record what we're announcing.
+			txidsAndSizes := make([]interface{}, 0, len(toAnnounce))
+			for _, e := range toAnnounce {
+				key := e.ID.String()
+				announced[key] = struct{}{}
+				pendingAck = append(pendingAck, key)
+				txidsAndSizes = append(txidsAndSizes, []interface{}{[]byte(e.ID), e.Size})
+			}
 
-		// MsgReplyTxIds = [1, txIdsAndSizes]
-		replyMsg, _ := cbor.Marshal([]interface{}{uint8(tsTagReplyTxIds), txidsAndSizes})
-		if err := mc.Send(mux.ProtoTxSubmission, replyMsg); err != nil {
-			return fmt.Errorf("txsubmission outbound reply txids: %w", err)
-		}
+			if len(toAnnounce) > 0 {
+				log.Info("txsubmission outbound: advertising txids to peer",
+					zap.Int("count", len(toAnnounce)),
+					zap.String("first_txid", toAnnounce[0].ID.String()[:16]+"..."))
+			}
+
+			replyMsg, _ := cbor.Marshal([]interface{}{uint8(tsTagReplyTxIds), txidsAndSizes})
+			if err := mc.Send(mux.ProtoTxSubmission, replyMsg); err != nil {
+				return fmt.Errorf("txsubmission outbound reply txids: %w", err)
+			}
 
 		case tsTagRequestTxs:
 			// MsgRequestTxs = [2, txidList]
@@ -142,11 +170,13 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 
 			// Look up and return txs
 			txList := make([]interface{}, 0, len(txidList))
-			requestedIDs := make([]string, 0, len(txidList))
+			logIDs := make([]string, 0, len(txidList))
 			for _, rawID := range txidList {
 				var txid []byte
 				_ = cbor.Unmarshal(rawID, &txid)
-				requestedIDs = append(requestedIDs, mempool.TxID(txid).String()[:16]+"...")
+				if len(txid) >= 8 {
+					logIDs = append(logIDs, mempool.TxID(txid).String()[:16]+"...")
+				}
 				if e, ok := pool.Get(mempool.TxID(txid)); ok {
 					txList = append(txList, e.Raw)
 				}
@@ -154,7 +184,7 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 			log.Info("txsubmission outbound: peer requested tx bodies",
 				zap.Int("requested", len(txidList)),
 				zap.Int("found_in_pool", len(txList)),
-				zap.Strings("txids", requestedIDs))
+				zap.Strings("txids", logIDs))
 
 			// MsgReplyTxs = [3, txList]
 			replyMsg, _ := cbor.Marshal([]interface{}{uint8(tsTagReplyTxs), txList})

@@ -198,21 +198,17 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, lo
 			}
 
 		case csTagRollBackward:
-			// MsgRollBackward = [3, point, tip]
-			// A chain reorganisation: roll back to the given point and broadcast
-			// to all downstream ChainSync servers so they send MsgRollBackward too.
+			// MsgRollBackward = [3, rollback_point, tip]
+			// respMsg[1] = rollback_point = [slotNo, hash]  (no blockNo)
+			// respMsg[2] = tip            = [[slotNo, hash], blockNo]
 			if len(respMsg) >= 3 {
-				rollPt, rollBlockNo := decodePoint(respMsg[1])
-				tipRaw := cbor.RawMessage(nil)
-				if len(respMsg) >= 3 {
-					tipRaw = respMsg[2]
-				}
+				rollPt, _ := decodePoint(respMsg[1])       // point only
+				_, tipBlockNo := decodePoint(respMsg[2])   // blockNo from tip tuple
+				tipRaw := respMsg[2]
 				log.Info("chainsync client: rollback",
 					zap.Uint64("to_slot", rollPt.SlotNo),
-					zap.Uint64("block_no", rollBlockNo))
-				// Truncate our ring buffer and notify downstream servers.
-				store.Rollback(rollPt, tipRaw, rollBlockNo)
-				// Re-add TTL pruning at the new tip slot.
+					zap.Uint64("tip_block_no", tipBlockNo))
+				store.Rollback(rollPt, tipRaw, tipBlockNo)
 				if pool != nil {
 					pool.PruneTTL(rollPt.SlotNo)
 				}

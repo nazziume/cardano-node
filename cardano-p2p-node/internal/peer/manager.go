@@ -50,6 +50,10 @@ type Manager struct {
 	pool  *mempool.Mempool
 	log   *zap.Logger
 
+	// ctx is stored so that dynamically discovered peers can be dialled
+	// even from callbacks that don't receive a context argument.
+	ctx context.Context
+
 	mu         sync.RWMutex
 	peers      map[string]*connState // addr → state
 	knownAddrs map[string]bool
@@ -103,12 +107,11 @@ func (m *Manager) SetConnectHook(on func(ConnInfo), off func(ConnInfo)) {
 // Run starts the peer manager. It connects to static peers and listens for
 // inbound connections. Blocks until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) error {
+	m.ctx = ctx // store for use by dynamic peer discovery callbacks
 	go m.listenLoop(ctx)
-
 	for _, addr := range m.cfg.StaticPeers {
 		go m.connectLoop(ctx, addr)
 	}
-
 	<-ctx.Done()
 	return nil
 }
@@ -317,16 +320,30 @@ func (m *Manager) connectOutbound(ctx context.Context, addr string) error {
 }
 
 // onNewPeers handles newly discovered peer addresses from peer sharing.
+// It registers the addresses and immediately tries to dial any that are new.
 func (m *Manager) onNewPeers(peers []protocol.PeerAddress) {
+	var addrs []string
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for _, p := range peers {
 		addr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
 		if !m.knownAddrs[addr] {
 			m.knownAddrs[addr] = true
-			m.log.Info("discovered new peer via peer sharing", zap.String("addr", addr))
+			addrs = append(addrs, addr)
 		}
+	}
+	m.mu.Unlock()
+
+	if len(addrs) == 0 {
+		return
+	}
+	ctx := m.ctx
+	if ctx == nil {
+		return
+	}
+	// Dial newly discovered peers (respects outboundSem limit).
+	for _, addr := range addrs {
+		m.log.Info("discovered new peer via peer sharing", zap.String("addr", addr))
+		go m.connectLoop(ctx, addr)
 	}
 }
 
