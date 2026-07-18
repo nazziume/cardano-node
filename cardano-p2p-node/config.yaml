@@ -1,0 +1,30 @@
+# Cardano P2P Node Configuration
+#
+# network: mainnet | preview | preprod | sanchonet
+network: mainnet
+
+# Local address to listen on for inbound connections
+# Set to empty string to disable inbound connections
+listenAddr: "0.0.0.0:3000"
+
+# Static upstream peers to always maintain connections to
+# These are the nodes we pull headers and blocks from.
+# Connect to well-known relays or SPO nodes for best performance.
+staticPeers:
+  # Example mainnet public relays (replace with fast peers near you)
+  - "backbone.cardano-mainnet.iohk.io:3001"
+  - "backbone.mainnet.emurgornd.com:3000"
+  - "backbone.mainnet.cardanofoundation.org:3001"
+
+# Maximum number of inbound connections
+# Higher values = more peers score us highly = better reputation
+maxInbound: 50
+
+# Maximum number of maintained outbound connections
+maxOutbound: 10
+
+# Delay before reconnecting to a lost peer
+reconnectDelay: "10s"
+
+# Logging level: debug | info | warn | error
+logLevel: "info"
