@@ -24,9 +24,11 @@ const (
 )
 
 // recentBlockWindow is the number of recent block bodies to proactively fetch.
-// Only the last N blocks matter for fetchyness scoring; older blocks are
-// unlikely to be requested by downstream peers still in the hot peer set.
-const recentBlockWindow = 10
+// Matches defaultMaxBlockCache so every block we cache is one we've fetched.
+// With 50 outbound peers streaming new blocks, fetching 50 deep ensures any
+// inbound peer requesting a recent block hits our cache (fetchynessBlocks score).
+// Each block is ~50 KB so 50 blocks ≈ 2.5 MB per outbound connection peak.
+const recentBlockWindow = 50
 
 // BlockFetchClient downloads blocks for the most recent headers in the store.
 //

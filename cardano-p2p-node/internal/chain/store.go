@@ -31,7 +31,13 @@ type Block struct {
 	Raw   cbor.RawMessage
 }
 
-const defaultRingSize = 256
+// defaultRingSize is the number of recent headers to retain.
+// 2160 matches Cardano's security parameter k (the finality depth on mainnet).
+// A larger ring means:
+//   - More candidates in MsgFindIntersect → intersection succeeds with more peers → fewer genesis rollbacks
+//   - ChainSync server can serve deeper headers to slow inbound peers
+//   - Each header is ~500 B, so 2160 headers ≈ 1 MB RAM
+const defaultRingSize = 2160
 
 // RollbackEvent is broadcast to downstream ChainSync servers on a chain reorg.
 type RollbackEvent struct {
@@ -65,9 +71,11 @@ type Store struct {
 }
 
 // defaultMaxBlockCache is the number of recent block bodies to keep.
-// This covers ~1 hour of mainnet blocks (1 block/20s × 200s buffer = 10 recent).
-// Downstream peers requesting older blocks will receive MsgNoBlocks.
-const defaultMaxBlockCache = 20
+// 256 blocks × ~50 KB average ≈ 12.8 MB RAM.
+// A larger cache directly improves fetchynessBlocks peer quality scores:
+// inbound peers requesting any of the last 256 blocks will be served immediately
+// rather than receiving MsgNoBlocks and scoring us zero for that request.
+const defaultMaxBlockCache = 256
 
 // New creates a new Store.
 func New() *Store {
@@ -164,8 +172,25 @@ func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) {
 
 // AddHeader adds a new block header, advancing the tip.
 // It notifies all waiting subscribers immediately.
+//
+// Deduplication: with 50 outbound peers all relaying the same new block
+// header within milliseconds of each other, the same (slot, hash) pair
+// would otherwise be appended 50 times.  Each duplicate causes the
+// ChainSync server to send an extra MsgRollForward to inbound peers,
+// wasting bandwidth and potentially confusing them.
+//
+// We skip the write (and skip subscriber notification) if the incoming
+// header exactly matches the current tip — the common case when many
+// peers simultaneously announce the same new block.
 func (s *Store) AddHeader(h Header) {
 	s.mu.Lock()
+
+	// Deduplicate: skip if already at this exact (slot, hash) tip.
+	if s.tip.SlotNo == h.Point.SlotNo && hashKey(s.tip.Hash) == hashKey(h.Point.Hash) {
+		s.mu.Unlock()
+		return // already have this header; suppress duplicate notification
+	}
+
 	if len(s.headers) >= defaultRingSize {
 		// Drop oldest
 		s.headers = s.headers[1:]
