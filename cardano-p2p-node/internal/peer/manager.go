@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -240,12 +241,49 @@ func (m *Manager) runInbound(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// isIPv6Addr returns true if addr is an IPv6 address (not a hostname).
+func isIPv6Addr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.To4() == nil
+}
+
+// isPermanentDialError returns true for errors that won't resolve on retry:
+// DNS not found, IPv6 unreachable on an IPv4-only machine, etc.
+// For these, we back off significantly rather than hammering every 10s.
+func isPermanentDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "no such host") ||
+		strings.Contains(s, "network is unreachable") ||
+		strings.Contains(s, "i/o timeout")
+}
+
 // connectLoop maintains a persistent outbound connection to addr,
-// reconnecting on failure with exponential back-off up to ReconnectDelay.
+// reconnecting on failure with back-off up to ReconnectDelay.
+// IPv6 addresses are skipped entirely when the host has no IPv6 routing.
 func (m *Manager) connectLoop(ctx context.Context, addr string) {
 	delay := m.cfg.ReconnectDelay
 	if delay == 0 {
 		delay = 10 * time.Second
+	}
+
+	// Skip IPv6 addresses if the machine has no IPv6 connectivity.
+	// Attempting them repeatedly just wastes outbound slots and logs noise.
+	if isIPv6Addr(addr) {
+		conn, err := net.DialTimeout("tcp6", addr, 3*time.Second)
+		if err != nil && strings.Contains(err.Error(), "network is unreachable") {
+			m.log.Debug("connectLoop: skipping IPv6 peer (no IPv6 routing)", zap.String("addr", addr))
+			return
+		}
+		if conn != nil {
+			conn.Close()
+		}
 	}
 
 	for {
@@ -263,17 +301,25 @@ func (m *Manager) connectLoop(ctx context.Context, addr string) {
 		}
 
 		m.log.Info("connecting to peer", zap.String("addr", addr))
-		if err := m.connectOutbound(ctx, addr); err != nil {
+		err := m.connectOutbound(ctx, addr)
+		if err != nil {
 			m.log.Warn("outbound connection ended",
 				zap.String("addr", addr), zap.Error(err))
 		}
 
 		<-m.outboundSem // release slot before sleeping
 
+		// Use a longer back-off for permanent errors (DNS, IPv6 unreachable)
+		// so we don't retry every 10s forever.
+		retryDelay := delay
+		if err != nil && isPermanentDialError(err) {
+			retryDelay = 5 * time.Minute
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-time.After(retryDelay):
 		}
 	}
 }

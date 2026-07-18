@@ -4,6 +4,7 @@ package chain
 
 import (
 	"sync"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -68,6 +69,15 @@ type Store struct {
 	subsMu   sync.Mutex
 	subs     []chan struct{}
 	rollSubs []chan RollbackEvent
+
+	// lastGenesisRollback rate-limits genesis rollbacks.
+	// With 50 outbound peers all reconnecting simultaneously, each one
+	// sends MsgRollBackward(origin), wiping the ring buffer before the
+	// previous peer's fast-forward sync has accumulated enough headers
+	// for subsequent peers to find an intersection.
+	// A short cooldown (5s) allows the first peer to stream ~thousands
+	// of headers into the ring before other peers can wipe it again.
+	lastGenesisRollback time.Time
 }
 
 // defaultMaxBlockCache is the number of recent block bodies to keep.
@@ -100,11 +110,30 @@ func (s *Store) CurrentSlot() uint64 {
 	return s.tip.SlotNo
 }
 
+// genesisRollbackCooldown prevents cascading genesis rollbacks when many
+// peers reconnect simultaneously. 5 seconds is enough for the first peer to
+// stream thousands of headers so subsequent peers can find an intersection.
+const genesisRollbackCooldown = 5 * time.Second
+
 // Rollback truncates the header ring to the given exact point (slot + hash)
 // and cleans the block cache of entries beyond that point.
 // All downstream ChainSync servers are notified so they issue MsgRollBackward.
-func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) {
+//
+// Returns false if a genesis rollback was suppressed by the rate-limiter.
+// The caller (ChainSyncClient) should close the peer session in that case;
+// the peer manager will reconnect, and by then the ring has enough headers
+// for intersection to succeed without another genesis rollback.
+func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) bool {
 	s.mu.Lock()
+
+	if pt.IsOrigin() {
+		now := time.Now()
+		if !s.lastGenesisRollback.IsZero() && now.Sub(s.lastGenesisRollback) < genesisRollbackCooldown {
+			s.mu.Unlock()
+			return false // rate-limited; caller should close this peer session
+		}
+		s.lastGenesisRollback = now
+	}
 
 	// Keep only headers that precede the rollback point.
 	// Headers AT the exact rollback point are also kept (inclusive).
@@ -168,6 +197,7 @@ func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) {
 		}
 	}
 	s.subsMu.Unlock()
+	return true
 }
 
 // AddHeader adds a new block header, advancing the tip.

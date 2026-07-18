@@ -226,7 +226,14 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, lo
 				log.Info("chainsync client: rollback",
 					zap.Uint64("to_slot", rollPt.SlotNo),
 					zap.Uint64("tip_block_no", tipBlockNo))
-				store.Rollback(rollPt, tipRaw, tipBlockNo)
+				if !store.Rollback(rollPt, tipRaw, tipBlockNo) {
+					// Genesis rollback was rate-limited (cooldown active).
+					// Close this session; the peer manager reconnects after 10s
+					// by which time the ring has enough headers for intersection.
+					log.Warn("chainsync client: genesis rollback suppressed by rate-limiter, reconnecting later",
+						zap.Uint64("tip_block_no", tipBlockNo))
+					return nil
+				}
 				if pool != nil {
 					pool.PruneTTL(rollPt.SlotNo)
 				}
