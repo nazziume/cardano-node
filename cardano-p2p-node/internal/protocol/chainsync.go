@@ -222,9 +222,32 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, lo
 			// respMsg[1] = rollback_point = [slotNo, hash]  (no blockNo)
 			// respMsg[2] = tip            = [[slotNo, hash], blockNo]
 			if len(respMsg) >= 3 {
-				rollPt, _ := decodePoint(respMsg[1])       // point only
-				_, tipBlockNo := decodePoint(respMsg[2])   // blockNo from tip tuple
+				rollPt, _ := decodePoint(respMsg[1])
+				_, tipBlockNo := decodePoint(respMsg[2])
 				tipRaw := respMsg[2]
+
+				// Guard against deep rollbacks that wipe significant chain state.
+				//
+				// When a new peer connects with an intersection at origin, it asks
+				// us to roll back to genesis so it can replay the whole chain.
+				// With 10 concurrent peers all doing this simultaneously, each one
+				// wipes the headers built by the others, causing an infinite loop
+				// of genesis re-syncs.
+				//
+				// Cardano's finality depth (k=2160 on mainnet, similar on preview)
+				// guarantees that honest nodes never roll back more than ~2160 blocks.
+				// Any rollback to genesis from a peer while our store is already well
+				// ahead indicates a stale/slow peer.  Close this peer's session so
+				// the peer manager can reconnect and find a proper intersection.
+				currentTip, _ := store.Tip()
+				const deepRollbackThreshold = uint64(1000) // ~1000 slots ≈ first few minutes
+				if rollPt.IsOrigin() && currentTip.SlotNo > deepRollbackThreshold {
+					log.Warn("chainsync client: refusing genesis rollback, closing session to reconnect",
+						zap.Uint64("store_tip_slot", currentTip.SlotNo),
+						zap.Uint64("peer_tip_block", tipBlockNo))
+					return nil // peer manager will reconnect after delay
+				}
+
 				log.Info("chainsync client: rollback",
 					zap.Uint64("to_slot", rollPt.SlotNo),
 					zap.Uint64("tip_block_no", tipBlockNo))
