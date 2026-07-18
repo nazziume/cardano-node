@@ -26,6 +26,14 @@ type TxEntry struct {
 	Parsed      *cardano.ParsedTx  // decoded transaction fields; nil if unparseable
 }
 
+// Stats holds mempool lifetime counters.
+type Stats struct {
+	Added            uint64 // total txs ever added
+	RemovedConfirmed uint64 // txs removed because they appeared in a block
+	RemovedTTL       uint64 // txs removed because their TTL expired
+	RemovedEvicted   uint64 // txs evicted due to capacity limit
+}
+
 // Mempool is a thread-safe in-memory transaction pool.
 // Transactions are stored in insertion order (FIFO) for serving peers.
 type Mempool struct {
@@ -33,6 +41,7 @@ type Mempool struct {
 	txs     map[string]*TxEntry // txid hex → entry
 	order   []string            // insertion order (txid hex)
 	maxSize int
+	stats   Stats
 
 	// onAdd is called (in the calling goroutine) when a new tx is added.
 	// Used for logging; must be non-blocking.
@@ -84,10 +93,12 @@ func (m *Mempool) Add(entry *TxEntry) bool {
 		oldest := m.order[0]
 		m.order = m.order[1:]
 		delete(m.txs, oldest)
+		m.stats.RemovedEvicted++
 	}
 
 	m.txs[key] = entry
 	m.order = append(m.order, key)
+	m.stats.Added++
 
 	// Call hook while still holding the lock so the caller sees a consistent view.
 	if m.onAdd != nil {
@@ -159,6 +170,76 @@ func (m *Mempool) TxIDsAfter(afterIdx int, n int) ([]*TxEntry, int) {
 		}
 	}
 	return result, end
+}
+
+// RemoveConfirmed removes transactions that have been included in a confirmed block.
+// txids is a list of 32-byte Blake2b-256 hashes.
+// Returns the number of transactions actually removed.
+func (m *Mempool) RemoveConfirmed(txids []TxID) int {
+	if len(txids) == 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	removed := 0
+	toDelete := make(map[string]bool, len(txids))
+	for _, id := range txids {
+		toDelete[id.String()] = true
+	}
+
+	newOrder := m.order[:0]
+	for _, key := range m.order {
+		if toDelete[key] {
+			delete(m.txs, key)
+			removed++
+		} else {
+			newOrder = append(newOrder, key)
+		}
+	}
+	m.order = newOrder
+	m.stats.RemovedConfirmed += uint64(removed)
+	return removed
+}
+
+// PruneTTL removes transactions whose TTL (time-to-live slot) has expired.
+// currentSlot is the current chain slot as seen by ChainSync.
+// Returns the number of transactions pruned.
+func (m *Mempool) PruneTTL(currentSlot uint64) int {
+	if currentSlot == 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	removed := 0
+	newOrder := m.order[:0]
+	for _, key := range m.order {
+		e := m.txs[key]
+		if e == nil {
+			continue
+		}
+		expired := false
+		if e.Parsed != nil && e.Parsed.TTL != nil && *e.Parsed.TTL < currentSlot {
+			expired = true
+		}
+		if expired {
+			delete(m.txs, key)
+			removed++
+		} else {
+			newOrder = append(newOrder, key)
+		}
+	}
+	m.order = newOrder
+	m.stats.RemovedTTL += uint64(removed)
+	return removed
+}
+
+// GetStats returns a snapshot of lifetime mempool statistics.
+func (m *Mempool) GetStats() Stats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.stats
 }
 
 // Size returns the number of transactions in the pool.

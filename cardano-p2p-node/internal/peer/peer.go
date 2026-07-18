@@ -116,18 +116,20 @@ func (p *Peer) Run(ctx context.Context) error {
 		// Outbound (we connected): we run initiator-side protocols
 		p.wg.Add(4)
 
-		// ChainSync CLIENT: pull headers from them → builds our chain knowledge
+		// ChainSync CLIENT: pull headers from them → builds our chain knowledge.
+		// Also triggers TTL pruning of the mempool on each new slot.
 		go func() {
 			defer p.wg.Done()
-			if err := protocol.ChainSyncClient(p.mc, p.store, p.log, p.done); err != nil {
+			if err := protocol.ChainSyncClient(p.mc, p.store, p.pool, p.log, p.done); err != nil {
 				errCh <- fmt.Errorf("chainsync client: %w", err)
 			}
 		}()
 
-		// BlockFetch CLIENT: pull blocks from them → lets us serve fetchyness
+		// BlockFetch CLIENT: pull blocks → lets us serve fetchyness.
+		// Also extracts confirmed txids to clean the mempool.
 		go func() {
 			defer p.wg.Done()
-			if err := protocol.BlockFetchClient(p.mc, p.store, p.log, p.done); err != nil {
+			if err := protocol.BlockFetchClient(p.mc, p.store, p.pool, p.log, p.done); err != nil {
 				errCh <- fmt.Errorf("blockfetch client: %w", err)
 			}
 		}()

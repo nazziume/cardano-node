@@ -33,6 +33,13 @@ type Block struct {
 
 const defaultRingSize = 256
 
+// RollbackEvent is broadcast to downstream ChainSync servers on a chain reorg.
+type RollbackEvent struct {
+	Point   Point
+	TipRaw  cbor.RawMessage
+	BlockNo uint64
+}
+
 // Store is a thread-safe rolling buffer of recent chain state.
 // When new headers arrive from upstream, it notifies all subscribers
 // so downstream ChainSync servers can forward them immediately.
@@ -49,13 +56,12 @@ type Store struct {
 	tipBlock uint64
 
 	// maxBlockCache controls how many recent block bodies to keep.
-	// Older blocks are evicted; downstream peers that are too far behind
-	// will receive MsgNoBlocks and must fetch from other peers.
 	maxBlockCache int
 
-	// Subscribers waiting for new headers
-	subsMu sync.Mutex
-	subs   []chan struct{}
+	// Subscribers waiting for new headers (forward signal)
+	subsMu   sync.Mutex
+	subs     []chan struct{}
+	rollSubs []chan RollbackEvent
 }
 
 // defaultMaxBlockCache is the number of recent block bodies to keep.
@@ -77,6 +83,59 @@ func (s *Store) Tip() (Point, uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.tip, s.tipBlock
+}
+
+// CurrentSlot returns the chain tip slot (0 if unknown).
+func (s *Store) CurrentSlot() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tip.SlotNo
+}
+
+// Rollback truncates the header ring to the given point and notifies
+// all downstream ChainSync servers so they can issue MsgRollBackward.
+func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) {
+	s.mu.Lock()
+	newHeaders := s.headers[:0]
+	for _, h := range s.headers {
+		if h.Point.SlotNo <= pt.SlotNo {
+			newHeaders = append(newHeaders, h)
+		}
+	}
+	s.headers = newHeaders
+	if pt.IsOrigin() {
+		s.tip = Point{}
+		s.tipBlock = 0
+	} else {
+		s.tip = pt
+		s.tipBlock = tipBlockNo
+	}
+	evt := RollbackEvent{Point: pt, TipRaw: tipRaw, BlockNo: tipBlockNo}
+	s.mu.Unlock()
+
+	// Notify rollback subscribers
+	s.subsMu.Lock()
+	for _, ch := range s.rollSubs {
+		select {
+		case ch <- evt:
+		default:
+			// If the channel is full, overwrite with the latest event.
+			// The receiver will see the most recent rollback point.
+			select {
+			case <-ch:
+			default:
+			}
+			ch <- evt
+		}
+	}
+	// Also wake forward-header subscribers (they need to re-sync their position)
+	for _, ch := range s.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	s.subsMu.Unlock()
 }
 
 // AddHeader adds a new block header, advancing the tip.
@@ -196,6 +255,28 @@ func (s *Store) Unsubscribe(ch chan struct{}) {
 	for i, c := range s.subs {
 		if c == ch {
 			s.subs = append(s.subs[:i], s.subs[i+1:]...)
+			return
+		}
+	}
+}
+
+// SubscribeRollback returns a channel that receives a RollbackEvent whenever
+// the chain rolls back. The caller must call UnsubscribeRollback when done.
+func (s *Store) SubscribeRollback() chan RollbackEvent {
+	ch := make(chan RollbackEvent, 2)
+	s.subsMu.Lock()
+	s.rollSubs = append(s.rollSubs, ch)
+	s.subsMu.Unlock()
+	return ch
+}
+
+// UnsubscribeRollback removes a rollback subscription.
+func (s *Store) UnsubscribeRollback(ch chan RollbackEvent) {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	for i, c := range s.rollSubs {
+		if c == ch {
+			s.rollSubs = append(s.rollSubs[:i], s.rollSubs[i+1:]...)
 			return
 		}
 	}

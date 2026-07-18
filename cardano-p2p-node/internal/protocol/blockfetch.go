@@ -7,7 +7,9 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
 
+	"github.com/cardano-p2p-node/internal/cardano"
 	"github.com/cardano-p2p-node/internal/chain"
+	"github.com/cardano-p2p-node/internal/mempool"
 	"github.com/cardano-p2p-node/internal/mux"
 )
 
@@ -32,10 +34,11 @@ const recentBlockWindow = 10
 // It does NOT download historical blocks — only the latest recentBlockWindow blocks
 // are fetched so they can be served immediately to downstream peers.
 //
-// Blocks are fetched in consecutive RANGE batches to minimise round-trips:
-// instead of N individual requests, a single MsgRequestRange covers a run of
-// consecutive missing blocks and the server streams all of them back at once.
-func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-chan struct{}) error {
+// Blocks are fetched in consecutive RANGE batches to minimise round-trips.
+//
+// After receiving each block, its transaction IDs are extracted and removed
+// from the mempool — confirmed transactions must not stay in the mempool.
+func BlockFetchClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoBlockFetch)
 	newHeaderCh := store.Subscribe()
 	defer store.Unsubscribe(newHeaderCh)
@@ -74,7 +77,7 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-
 				return sendBlockFetchDone(mc)
 			default:
 			}
-			if err := fetchRange(mc, r, store, run, log); err != nil {
+			if err := fetchRange(mc, r, store, pool, run, log); err != nil {
 				return err
 			}
 		}
@@ -102,7 +105,8 @@ func groupIntoRuns(headers []chain.Header) [][]chain.Header {
 
 // fetchRange sends a single MsgRequestRange for [first, last] and reads the
 // streamed blocks, storing each one immediately as it arrives.
-func fetchRange(mc *mux.Conn, r io.Reader, store *chain.Store, run []chain.Header, log *zap.Logger) error {
+// Confirmed txids are extracted from each block and removed from the mempool.
+func fetchRange(mc *mux.Conn, r io.Reader, store *chain.Store, pool *mempool.Mempool, run []chain.Header, log *zap.Logger) error {
 	if len(run) == 0 {
 		return nil
 	}
@@ -170,6 +174,23 @@ func fetchRange(mc *mux.Conn, r io.Reader, store *chain.Store, run []chain.Heade
 				}
 				// Store immediately — downstream peers can serve this block now.
 				store.AddBlock(chain.Block{Point: pt, Raw: bMsg[1]})
+
+				// Extract confirmed txids and remove them from the mempool.
+				// Transactions that appear in a block are no longer pending.
+				if pool != nil {
+					if txids := cardano.ParseBlockTxIDs(bMsg[1]); len(txids) > 0 {
+						mids := make([]mempool.TxID, len(txids))
+						for i, id := range txids {
+							mids[i] = mempool.TxID(id)
+						}
+						removed := pool.RemoveConfirmed(mids)
+						if removed > 0 {
+							log.Info("blockfetch: removed confirmed txs from mempool",
+								zap.Int("removed", removed),
+								zap.Uint64("slot", pt.SlotNo))
+						}
+					}
+				}
 				log.Debug("blockfetch client: stored block", zap.Uint64("slot", pt.SlotNo))
 
 			case bfTagBatchDone:

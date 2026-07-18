@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/cardano-p2p-node/internal/chain"
+	"github.com/cardano-p2p-node/internal/mempool"
 	"github.com/cardano-p2p-node/internal/mux"
 )
 
@@ -30,7 +31,10 @@ const (
 // Historical headers (before our tip) are requested only to find the intersection
 // point. We never store more than the last 256 headers (chain.Store ring size).
 // No block bodies are downloaded here — that is the job of BlockFetchClient.
-func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-chan struct{}) error {
+//
+// pool is optional: if non-nil, TTL-expired transactions are pruned from the
+// mempool whenever the chain tip advances to a new slot.
+func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoChainSync)
 
 	// Build intersection candidates from our known recent headers.
@@ -171,13 +175,21 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 			// This is the critical latency path for upstreamyness scoring.
 			store.AddHeader(h)
 
+			// Prune TTL-expired transactions now that the slot has advanced.
+			if pool != nil && atTip {
+				if pruned := pool.PruneTTL(pt.SlotNo); pruned > 0 {
+					log.Info("chainsync client: pruned TTL-expired txs",
+						zap.Int("pruned", pruned),
+						zap.Uint64("slot", pt.SlotNo))
+				}
+			}
+
 			if atTip {
 				log.Debug("chainsync client: new live header",
 					zap.Uint64("slot", pt.SlotNo),
 					zap.Uint64("blockNo", blockNo))
 			} else {
 				fastForwardCount++
-				// Log progress every 10 000 headers during fast-forward
 				if fastForwardCount%10000 == 0 {
 					log.Info("chainsync client: fast-forwarding",
 						zap.Uint64("headers_received", fastForwardCount),
@@ -187,13 +199,23 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 
 		case csTagRollBackward:
 			// MsgRollBackward = [3, point, tip]
-			// A rollback happens during chain reorganisations.
-			// We clear our store back to the rollback point.
+			// A chain reorganisation: roll back to the given point and broadcast
+			// to all downstream ChainSync servers so they send MsgRollBackward too.
 			if len(respMsg) >= 3 {
-				pt, _ := decodePoint(respMsg[1])
-				log.Info("chainsync client: rollback", zap.Uint64("to_slot", pt.SlotNo))
-				// The store's ring buffer will naturally handle this:
-				// new headers from the fork will overwrite old ones.
+				rollPt, rollBlockNo := decodePoint(respMsg[1])
+				tipRaw := cbor.RawMessage(nil)
+				if len(respMsg) >= 3 {
+					tipRaw = respMsg[2]
+				}
+				log.Info("chainsync client: rollback",
+					zap.Uint64("to_slot", rollPt.SlotNo),
+					zap.Uint64("block_no", rollBlockNo))
+				// Truncate our ring buffer and notify downstream servers.
+				store.Rollback(rollPt, tipRaw, rollBlockNo)
+				// Re-add TTL pruning at the new tip slot.
+				if pool != nil {
+					pool.PruneTTL(rollPt.SlotNo)
+				}
 			}
 
 		case csTagDone:
@@ -296,6 +318,9 @@ func chainSyncServe(
 	newHeaderCh := store.Subscribe()
 	defer store.Unsubscribe(newHeaderCh)
 
+	rollbackCh := store.SubscribeRollback()
+	defer store.UnsubscribeRollback(rollbackCh)
+
 	// requestCh receives a token for every MsgRequestNext we get.
 	// Buffered so the reader goroutine is never blocked by a slow sender.
 	requestCh := make(chan struct{}, 64)
@@ -395,9 +420,25 @@ func chainSyncServe(
 			return err
 		case <-requestCh:
 			pendingRequests++
+		case evt := <-rollbackCh:
+			// A chain rollback occurred. Send MsgRollBackward to our downstream peer.
+			// This tells them to discard headers beyond the rollback point.
+			rollMsg, _ := cbor.Marshal([]interface{}{
+				uint8(csTagRollBackward),
+				encodePoint(evt.Point),
+				evt.TipRaw,
+			})
+			if err := mc.Send(mux.ProtoChainSync, rollMsg); err != nil {
+				return fmt.Errorf("chainsync server: send rollback: %w", err)
+			}
+			// Reset our position tracking to the rollback point.
+			current := store.AllHeaders()
+			headerQ = nil
+			sentUpTo = len(current)
+			pendingRequests = 0 // client will re-request after processing rollback
+			log.Info("chainsync server: forwarded rollback", zap.Uint64("to_slot", evt.Point.SlotNo))
 		case <-newHeaderCh:
 			// Fetch newly added headers since we last checked.
-			// This is O(n) over new headers only, not the whole ring.
 			current := store.AllHeaders()
 			if len(current) > sentUpTo {
 				newOnes := current[sentUpTo:]

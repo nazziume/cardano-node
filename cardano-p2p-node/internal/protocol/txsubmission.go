@@ -3,6 +3,7 @@ package protocol
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
@@ -86,10 +87,11 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 			entries, newIdx := pool.TxIDsAfter(idx, int(reqCount))
 			idx = newIdx
 
-			if blocking && len(entries) == 0 {
-				// Blocking request: wait for new txs then reply
+		if len(entries) == 0 {
+			// No new txs yet. If the peer sent a blocking request, wait for
+			// a new tx to arrive (or done). For non-blocking, reply empty.
+			if blocking {
 				newTxCh := pool.Subscribe()
-				defer pool.Unsubscribe(newTxCh)
 				select {
 				case <-done:
 					pool.Unsubscribe(newTxCh)
@@ -99,7 +101,16 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 					entries, newIdx = pool.TxIDsAfter(idx, int(reqCount))
 					idx = newIdx
 				}
+			} else {
+				// Non-blocking + empty: throttle to avoid tight loop.
+				// The remote server will send another request shortly.
+				select {
+				case <-done:
+					return nil
+				case <-time.After(200 * time.Millisecond):
+				}
 			}
+		}
 
 			// Encode txids and sizes: [[txid, size], ...]
 			txidsAndSizes := make([]interface{}, 0, len(entries))

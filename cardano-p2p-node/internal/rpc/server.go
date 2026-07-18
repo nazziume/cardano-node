@@ -26,11 +26,12 @@ import (
 	"github.com/cardano-p2p-node/internal/peer"
 )
 
-// PoolWriter extends PoolSource with the ability to add transactions directly.
-// Implemented by *mempool.Mempool.
+// PoolWriter extends PoolSource with the ability to add transactions directly
+// and query statistics. Implemented by *mempool.Mempool.
 type PoolWriter interface {
 	PoolSource
 	Add(e *mempool.TxEntry) bool
+	GetStats() mempool.Stats
 }
 
 // ConnSource is implemented by the peer manager.
@@ -120,6 +121,15 @@ type statusResponse struct {
 	Inbound       int           `json:"inbound_count"`
 	Outbound      int           `json:"outbound_count"`
 	Connections   []connInfoOut `json:"connections"`
+	MempoolStats  mempoolStats  `json:"mempool_stats"`
+}
+
+type mempoolStats struct {
+	Current          int    `json:"current_size"`
+	TotalAdded       uint64 `json:"total_added"`
+	RemovedConfirmed uint64 `json:"removed_confirmed"` // txs removed after on-chain confirmation
+	RemovedTTL       uint64 `json:"removed_ttl"`       // txs removed due to TTL expiry
+	RemovedEvicted   uint64 `json:"removed_evicted"`   // txs evicted due to capacity
 }
 
 type connInfoOut struct {
@@ -137,12 +147,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	inb, outb := s.conns.Stats()
 	slot, blockNo := s.getTip()
 
+	st := s.pool.GetStats()
 	out := statusResponse{
 		ChainTipSlot:  slot,
 		ChainTipBlock: blockNo,
 		Inbound:       inb,
 		Outbound:      outb,
 		Connections:   make([]connInfoOut, 0, len(conns)),
+		MempoolStats: mempoolStats{
+			Current:          s.pool.Size(),
+			TotalAdded:       st.Added,
+			RemovedConfirmed: st.RemovedConfirmed,
+			RemovedTTL:       st.RemovedTTL,
+			RemovedEvicted:   st.RemovedEvicted,
+		},
 	}
 
 	now := time.Now()

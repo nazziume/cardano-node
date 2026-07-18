@@ -43,7 +43,7 @@ func TestChainSyncClientServer(t *testing.T) {
 	// Client should receive the headers
 	clientDone := make(chan error, 1)
 	go func() {
-		clientDone <- protocol.ChainSyncClient(ini, clientStore, clientLog, ctx.Done())
+		clientDone <- protocol.ChainSyncClient(ini, clientStore, nil, clientLog, ctx.Done())
 	}()
 
 	// Wait for client to sync the headers
