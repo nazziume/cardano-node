@@ -23,12 +23,13 @@ const (
 	bfTagBatchDone    = 5
 )
 
-// recentBlockWindow is the number of recent block bodies to proactively fetch.
-// Matches defaultMaxBlockCache so every block we cache is one we've fetched.
-// With 50 outbound peers streaming new blocks, fetching 50 deep ensures any
-// inbound peer requesting a recent block hits our cache (fetchynessBlocks score).
-// Each block is ~50 KB so 50 blocks ≈ 2.5 MB per outbound connection peak.
-const recentBlockWindow = 50
+// recentBlockWindow matches defaultMaxBlockCache (256).
+// We proactively fetch every block we can cache so inbound peer block requests
+// always hit our cache (maximises fetchynessBlocks peer quality score).
+// Each block is ~50 KB so 256 blocks ≈ 12.8 MB total across all connections,
+// but only unique blocks are stored — concurrent fetches of the same slot are
+// deduplicated by the store (AddBlock is idempotent by hash key).
+const recentBlockWindow = 256
 
 // BlockFetchClient downloads blocks for the most recent headers in the store.
 //

@@ -57,6 +57,7 @@ type RollbackEvent struct {
 type Store struct {
 	mu      sync.RWMutex
 	headers []Header         // ring buffer of recent headers (max defaultRingSize)
+	headerIdx map[string]int // hash → index in headers for O(1) FindIntersect
 	blocks  map[string]Block // hash → block body (only recent blocks)
 
 	tip      Point
@@ -91,6 +92,7 @@ const defaultMaxBlockCache = 256
 func New() *Store {
 	return &Store{
 		headers:       make([]Header, 0, defaultRingSize),
+		headerIdx:     make(map[string]int, defaultRingSize),
 		blocks:        make(map[string]Block),
 		maxBlockCache: defaultMaxBlockCache,
 	}
@@ -152,6 +154,11 @@ func (s *Store) Rollback(pt Point, tipRaw cbor.RawMessage, tipBlockNo uint64) bo
 		break
 	}
 	s.headers = newHeaders
+	// Rebuild headerIdx after rollback
+	s.headerIdx = make(map[string]int, len(newHeaders))
+	for i, h := range newHeaders {
+		s.headerIdx[hashKey(h.Point.Hash)] = i
+	}
 
 	// Clean block bodies for headers that were rolled back.
 	keepHashes := make(map[string]bool, len(newHeaders))
@@ -222,10 +229,20 @@ func (s *Store) AddHeader(h Header) {
 	}
 
 	if len(s.headers) >= defaultRingSize {
-		// Drop oldest
+		// Drop oldest and remove from index
+		oldest := s.headers[0]
+		delete(s.headerIdx, hashKey(oldest.Point.Hash))
 		s.headers = s.headers[1:]
+		// Re-index remaining headers after shift (indices changed by 1)
+		// To avoid O(n) re-indexing, rebuild only if needed; for simplicity
+		// we rebuild the whole index when at capacity. This is O(n) but rare.
+		for i, hdr := range s.headers {
+			s.headerIdx[hashKey(hdr.Point.Hash)] = i
+		}
 	}
+	idx := len(s.headers)
 	s.headers = append(s.headers, h)
+	s.headerIdx[hashKey(h.Point.Hash)] = idx
 	s.tip = h.Point
 	s.tipBlock = h.No
 	s.mu.Unlock()
@@ -275,6 +292,10 @@ func (s *Store) GetBlock(hash []byte) (Block, bool) {
 
 // FindIntersect finds the most recent common point from a list of candidate points.
 // Returns the found point and headers after it, or nil if none found.
+//
+// O(candidates) via headerIdx hash map — previously O(candidates × ring_size).
+// With 2160 headers in the ring and many concurrent inbound peers each calling
+// FindIntersect, the hash map reduces latency from ~2160 comparisons to ~1.
 func (s *Store) FindIntersect(candidates []Point) (found *Point, headersAfter []Header) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -285,11 +306,13 @@ func (s *Store) FindIntersect(candidates []Point) (found *Point, headersAfter []
 			p := cand
 			return &p, s.headers
 		}
-		// Find this point in our ring
-		for i, h := range s.headers {
-			if h.Point.SlotNo == cand.SlotNo && hashKey(h.Point.Hash) == hashKey(cand.Hash) {
+		// O(1) hash map lookup
+		if idx, ok := s.headerIdx[hashKey(cand.Hash)]; ok {
+			h := s.headers[idx]
+			// Verify slot matches (hash collision is astronomically unlikely but check anyway)
+			if h.Point.SlotNo == cand.SlotNo {
 				p := h.Point
-				return &p, s.headers[i+1:]
+				return &p, s.headers[idx+1:]
 			}
 		}
 	}

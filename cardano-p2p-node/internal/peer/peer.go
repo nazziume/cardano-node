@@ -150,17 +150,29 @@ func (p *Peer) Run(ctx context.Context) error {
 			}
 		}()
 
-		// Peer sharing client: discover new peers (optional, non-fatal)
+		// Peer sharing client: periodically discover new peers and propagate
+		// our own address. Runs every 15 minutes while the connection lives.
+		// Each request triggers PeerSharingServer on the remote to include our
+		// advertise address in its response, spreading us through the network.
 		if neg.PeerSharing {
 			go func() {
 				time.Sleep(5 * time.Second) // wait for connection to stabilize
-				peers, err := protocol.PeerSharingClient(p.mc, 20, p.log)
-				if err != nil {
-					p.log.Debug("peer sharing failed", zap.Error(err))
-					return
-				}
-				if p.onNewPeers != nil && len(peers) > 0 {
-					p.onNewPeers(peers)
+				ticker := time.NewTicker(15 * time.Minute)
+				defer ticker.Stop()
+				for {
+					peers, err := protocol.PeerSharingClient(p.mc, 20, p.log)
+					if err != nil {
+						p.log.Debug("peer sharing failed", zap.Error(err))
+						return
+					}
+					if p.onNewPeers != nil && len(peers) > 0 {
+						p.onNewPeers(peers)
+					}
+					select {
+					case <-p.done:
+						return
+					case <-ticker.C:
+					}
 				}
 			}()
 		}
