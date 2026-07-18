@@ -105,14 +105,43 @@ func (m *Manager) SetConnectHook(on func(ConnInfo), off func(ConnInfo)) {
 func (m *Manager) Run(ctx context.Context) error {
 	go m.listenLoop(ctx)
 
-	// Pre-fill outbound semaphore up to MaxOutbound, then launch static peers.
-	// Each connectLoop goroutine holds one semaphore slot while active.
 	for _, addr := range m.cfg.StaticPeers {
 		go m.connectLoop(ctx, addr)
 	}
 
 	<-ctx.Done()
 	return nil
+}
+
+// AddDynamicPeers is called by the ledger peer manager (and peer sharing) to
+// register newly discovered addresses. For each address that is not already
+// known, a connectLoop goroutine is spawned so we connect when a slot is free.
+func (m *Manager) AddDynamicPeers(ctx context.Context, addrs []string) {
+	m.mu.Lock()
+	var fresh []string
+	for _, addr := range addrs {
+		if !m.knownAddrs[addr] {
+			m.knownAddrs[addr] = true
+			fresh = append(fresh, addr)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, addr := range fresh {
+		addr := addr
+		go m.connectLoop(ctx, addr)
+	}
+	if len(fresh) > 0 {
+		m.log.Info("peer manager: added dynamic peers",
+			zap.Int("new", len(fresh)),
+			zap.Int("total_known", m.knownCount()))
+	}
+}
+
+func (m *Manager) knownCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.knownAddrs)
 }
 
 // listenLoop accepts inbound TCP connections.

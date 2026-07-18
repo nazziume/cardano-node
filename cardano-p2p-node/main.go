@@ -20,6 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/cardano-p2p-node/internal/chain"
+	"github.com/cardano-p2p-node/internal/ledger"
 	"github.com/cardano-p2p-node/internal/mempool"
 	"github.com/cardano-p2p-node/internal/peer"
 	"github.com/cardano-p2p-node/internal/protocol"
@@ -39,7 +40,27 @@ type Config struct {
 	ReconnectDelay string   `yaml:"reconnectDelay"`
 	LogLevel       string   `yaml:"logLevel"`
 	RPCAddr        string   `yaml:"rpcAddr"`
+
+	// Ledger peers configuration
+	LedgerPeers LedgerPeersConfig `yaml:"ledgerPeers"`
 }
+
+// LedgerPeersConfig controls ledger peer discovery.
+type LedgerPeersConfig struct {
+	// SnapshotFile is a path to a local peer snapshot JSON file.
+	SnapshotFile string `yaml:"snapshotFile"`
+	// SnapshotURL is an HTTP(S) URL to fetch the snapshot from.
+	// Defaults to the official IOG mainnet snapshot URL.
+	SnapshotURL string `yaml:"snapshotURL"`
+	// RefreshInterval: how often to re-fetch the snapshot. Default: 1h.
+	RefreshInterval string `yaml:"refreshInterval"`
+	// MaxPeers: max relay addresses to use per refresh. Default: 100.
+	MaxPeers int `yaml:"maxPeers"`
+	// Enabled: set false to disable ledger peer discovery. Default: true.
+	Enabled *bool `yaml:"enabled"`
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 func defaultConfig() Config {
 	return Config{
@@ -50,6 +71,12 @@ func defaultConfig() Config {
 		ReconnectDelay: "10s",
 		LogLevel:       "info",
 		RPCAddr:        "127.0.0.1:8888",
+		LedgerPeers: LedgerPeersConfig{
+			SnapshotURL:     "https://book.world.dev.cardano.org/environments/mainnet/peer-snapshot.json",
+			RefreshInterval: "1h",
+			MaxPeers:        100,
+			Enabled:         boolPtr(true),
+		},
 	}
 }
 
@@ -159,6 +186,49 @@ func main() {
 		log.Info("received signal, shutting down", zap.String("signal", sig.String()))
 		cancel()
 	}()
+
+	// Start ledger peers discovery
+	lpCfg := cfg.LedgerPeers
+	ledgerEnabled := lpCfg.Enabled == nil || *lpCfg.Enabled
+	if ledgerEnabled && (lpCfg.SnapshotFile != "" || lpCfg.SnapshotURL != "") {
+		refreshInterval, _ := time.ParseDuration(lpCfg.RefreshInterval)
+
+		// For non-mainnet, override the snapshot URL if not explicitly set
+		if lpCfg.SnapshotURL == defaultConfig().LedgerPeers.SnapshotURL {
+			switch cfg.Network {
+			case "preprod":
+				lpCfg.SnapshotURL = "https://book.world.dev.cardano.org/environments/preprod/peer-snapshot.json"
+			case "preview":
+				lpCfg.SnapshotURL = "https://book.world.dev.cardano.org/environments/preview/peer-snapshot.json"
+			}
+		}
+
+		lm := ledger.NewManager(ledger.Config{
+			SnapshotFile:    lpCfg.SnapshotFile,
+			SnapshotURL:     lpCfg.SnapshotURL,
+			RefreshInterval: refreshInterval,
+			MaxPeers:        lpCfg.MaxPeers,
+		}, log)
+
+		lm.OnPeers = func(peers []ledger.ResolvedPeer) {
+			addrs := make([]string, len(peers))
+			for i, p := range peers {
+				addrs[i] = p.Addr
+			}
+			log.Info("ledger peers: feeding addresses to peer manager",
+				zap.Int("count", len(addrs)))
+			mgr.AddDynamicPeers(ctx, addrs)
+		}
+
+		go lm.Run(ctx)
+		log.Info("ledger peers discovery started",
+			zap.String("url", lpCfg.SnapshotURL),
+			zap.String("file", lpCfg.SnapshotFile),
+			zap.Duration("refresh", refreshInterval),
+			zap.Int("maxPeers", lpCfg.MaxPeers))
+	} else {
+		log.Info("ledger peers discovery disabled")
+	}
 
 	// Start RPC server
 	if cfg.RPCAddr != "" {
