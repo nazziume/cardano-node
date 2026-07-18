@@ -21,8 +21,8 @@ staticPeers:
 maxInbound: 50
 
 # Maximum simultaneous outbound connections.
-# Keep this proportional to the number of staticPeers.
-maxOutbound: 10
+# 50 outbound connections give wide PeerSharing coverage (~2MB RAM each).
+maxOutbound: 50
 
 # How long to wait before reconnecting to a lost outbound peer.
 reconnectDelay: "10s"
