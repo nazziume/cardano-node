@@ -226,44 +226,19 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, lo
 				_, tipBlockNo := decodePoint(respMsg[2])
 				tipRaw := respMsg[2]
 
-				// Guard against deep rollbacks that wipe significant chain state.
-				//
-				// When a new peer connects with an intersection at origin, it asks
-				// us to roll back to genesis so it can replay the whole chain.
-				// With 10 concurrent peers all doing this simultaneously, each one
-				// wipes the headers built by the others, causing an infinite loop
-				// of genesis re-syncs.
-				//
-				// Cardano's finality depth (k=2160 on mainnet, similar on preview)
-				// guarantees that honest nodes never roll back more than ~2160 blocks.
-				// Any rollback to genesis from a peer while our store is already well
-				// ahead indicates a stale/slow peer.  Close this peer's session so
-				// the peer manager can reconnect and find a proper intersection.
-				currentTip, currentBlock := store.Tip()
-				const deepRollbackThreshold = uint64(1000)
-				const blockLeadThreshold = uint64(10) // peer must be >10 blocks ahead to justify genesis rollback
-				if rollPt.IsOrigin() && currentTip.SlotNo > deepRollbackThreshold {
-					if tipBlockNo > currentBlock+blockLeadThreshold {
-						// Peer is significantly ahead → we're likely on an abandoned fork.
-						// Accept rollback to resync on the canonical chain.
-						log.Warn("chainsync client: accepting genesis rollback (fork recovery)",
-							zap.Uint64("store_tip_slot", currentTip.SlotNo),
-							zap.Uint64("store_block", currentBlock),
-							zap.Uint64("peer_tip_block", tipBlockNo))
-					} else {
-						// Peer is at roughly the same height → concurrent genesis rollback.
-						// Close session; reconnect will find intersection without wiping store.
-						log.Warn("chainsync client: refusing genesis rollback, closing session",
-							zap.Uint64("store_tip_slot", currentTip.SlotNo),
-							zap.Uint64("peer_tip_block", tipBlockNo))
-						return nil
-					}
-				}
-
 				log.Info("chainsync client: rollback",
 					zap.Uint64("to_slot", rollPt.SlotNo),
 					zap.Uint64("tip_block_no", tipBlockNo))
-				store.Rollback(rollPt, tipRaw, tipBlockNo)
+
+				// store.Rollback returns false if a genesis rollback is
+				// rate-limited (30-second cooldown in the store).  Close the
+				// session so the peer manager reconnects later; by then the
+				// store will have enough headers for intersection to succeed.
+				if !store.Rollback(rollPt, tipRaw, tipBlockNo) {
+					log.Warn("chainsync client: genesis rollback rate-limited, closing session",
+						zap.Uint64("tip_block_no", tipBlockNo))
+					return nil
+				}
 				if pool != nil {
 					pool.PruneTTL(rollPt.SlotNo)
 				}
