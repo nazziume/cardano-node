@@ -26,8 +26,8 @@ import (
 	"github.com/cardano-p2p-node/internal/rpc"
 )
 
-// jst is UTC+9 (Japan Standard Time), used for all log timestamps.
-var jst = time.FixedZone("JST", 9*60*60)
+// jst is UTC+8 (China Standard Time), used for all log timestamps.
+var jst = time.FixedZone("CST", 8*60*60)
 
 // Config is the top-level node configuration.
 type Config struct {
@@ -83,7 +83,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Structured logger with UTC+9 timestamps
+	// Structured logger with UTC+8 timestamps
 	log := buildLogger(cfg.LogLevel)
 	defer log.Sync()
 
@@ -106,7 +106,7 @@ func main() {
 	chainStore := chain.New()
 	pool := mempool.New()
 
-	// Install a hook that logs every new transaction with UTC+9 timestamp.
+	// Install a hook that logs every new transaction with UTC+8 timestamp.
 	// This fires synchronously inside Add(), so it must be fast (just logging).
 	pool.SetOnAdd(func(e *mempool.TxEntry) {
 		log.Info("mempool: new transaction",
@@ -209,7 +209,7 @@ func main() {
 }
 
 // buildLogger creates a zap logger that:
-//   - uses UTC+9 (JST) for all timestamps
+//   - uses UTC+8 (CST) for all timestamps
 //   - outputs console-friendly coloured text to stdout
 //   - logs errors to stderr
 func buildLogger(level string) *zap.Logger {
@@ -225,9 +225,9 @@ func buildLogger(level string) *zap.Logger {
 		zapLevel = zapcore.InfoLevel
 	}
 
-	// Custom time encoder: RFC3339 in UTC+9
+	// Custom time encoder: RFC3339 in UTC+8
 	jstTimeEncoder := func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-		enc.AppendString(t.In(jst).Format("2006-01-02T15:04:05+09:00"))
+		enc.AppendString(t.In(jst).Format("2006-01-02T15:04:05+08:00"))
 	}
 
 	encoderCfg := zapcore.EncoderConfig{

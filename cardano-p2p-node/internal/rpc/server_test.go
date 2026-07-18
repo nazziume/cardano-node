@@ -116,13 +116,13 @@ func TestRPCStatus(t *testing.T) {
 		t.Errorf("connections count: got %d, want 2", len(connsArr))
 	}
 
-	// Check that connected_at is in UTC+9 format
+	// Check that connected_at is in UTC+8 format
 	c0 := connsArr[0].(map[string]interface{})
 	connectedAt := c0["connected_at"].(string)
 	if len(connectedAt) == 0 {
 		t.Error("connected_at should not be empty")
 	}
-	// Should contain +09:00 offset
+	// Should contain +08:00 offset
 	t.Logf("connected_at: %s", connectedAt)
 }
 
@@ -205,7 +205,7 @@ func TestRPCMempool(t *testing.T) {
 	if tx0["raw_hex"] != "010203" {
 		t.Errorf("raw_hex: got %v, want 010203", tx0["raw_hex"])
 	}
-	// received_at should be in UTC+9
+	// received_at should be in UTC+8
 	recvAt := tx0["received_at"].(string)
 	if len(recvAt) == 0 {
 		t.Error("received_at should not be empty")

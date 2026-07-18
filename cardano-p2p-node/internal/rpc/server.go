@@ -112,11 +112,11 @@ type connInfoOut struct {
 	IP          string `json:"ip"`
 	Port        string `json:"port"`
 	Direction   string `json:"direction"`
-	ConnectedAt string `json:"connected_at"` // UTC+9 RFC3339
+	ConnectedAt string `json:"connected_at"` // UTC+8 RFC3339
 	UptimeSec   int64  `json:"uptime_sec"`
 }
 
-var jst = time.FixedZone("JST", 9*60*60)
+var jst = time.FixedZone("CST", 8*60*60)
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	conns := s.conns.GetConnections()
@@ -156,7 +156,7 @@ type txOut struct {
 	TxID        string `json:"txid"`
 	SizeBytes   uint32 `json:"size_bytes"`
 	FromPeer    string `json:"from_peer"`
-	ReceivedAt  string `json:"received_at"` // UTC+9 RFC3339
+	ReceivedAt  string `json:"received_at"` // UTC+8 RFC3339
 	RawHex      string `json:"raw_hex"`     // full CBOR as hex
 }
 

@@ -32,16 +32,16 @@ reconnectDelay: "10s"
 # Set to "" to disable RPC.
 #
 # Endpoints:
-#   GET /status  → connection list (ip, port, direction, uptime, connected_at JST)
-#   GET /mempool → all transactions (txid, size, from_peer, received_at JST, raw hex)
+#   GET /status  → connection list (ip, port, direction, uptime, connected_at CST)
+#   GET /mempool → all transactions (txid, size, from_peer, received_at CST, raw hex)
 #   GET /health  → 200 OK liveness probe
 rpcAddr: "127.0.0.1:8888"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Logging level: debug | info | warn | error
-# All timestamps are in UTC+9 (JST).
+# All timestamps are in UTC+8 (CST).
 # Events logged automatically:
-#   - Inbound/outbound connections (ip, port, connected_at JST)
-#   - New mempool transactions (txid, size, from_peer, received_at JST)
+#   - Inbound/outbound connections (ip, port, connected_at CST)
+#   - New mempool transactions (txid, size, from_peer, received_at CST)
 #   - Chain tip progress during fast-forward and live relay
 logLevel: "info"
