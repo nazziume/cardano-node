@@ -219,26 +219,14 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, lo
 
 		case csTagRollBackward:
 			// MsgRollBackward = [3, rollback_point, tip]
-			// respMsg[1] = rollback_point = [slotNo, hash]  (no blockNo)
-			// respMsg[2] = tip            = [[slotNo, hash], blockNo]
 			if len(respMsg) >= 3 {
 				rollPt, _ := decodePoint(respMsg[1])
 				_, tipBlockNo := decodePoint(respMsg[2])
 				tipRaw := respMsg[2]
-
 				log.Info("chainsync client: rollback",
 					zap.Uint64("to_slot", rollPt.SlotNo),
 					zap.Uint64("tip_block_no", tipBlockNo))
-
-				// store.Rollback returns false if a genesis rollback is
-				// rate-limited (30-second cooldown in the store).  Close the
-				// session so the peer manager reconnects later; by then the
-				// store will have enough headers for intersection to succeed.
-				if !store.Rollback(rollPt, tipRaw, tipBlockNo) {
-					log.Warn("chainsync client: genesis rollback rate-limited, closing session",
-						zap.Uint64("tip_block_no", tipBlockNo))
-					return nil
-				}
+				store.Rollback(rollPt, tipRaw, tipBlockNo)
 				if pool != nil {
 					pool.PruneTTL(rollPt.SlotNo)
 				}
