@@ -325,7 +325,9 @@ func (m *Manager) onNewPeers(peers []protocol.PeerAddress) {
 	var addrs []string
 	m.mu.Lock()
 	for _, p := range peers {
-		addr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+		// Use net.JoinHostPort so IPv6 addresses are wrapped in brackets:
+		// "[2a01:...]:port" rather than the invalid "2a01:...:port".
+		addr := net.JoinHostPort(p.IP.String(), fmt.Sprintf("%d", p.Port))
 		// Skip our own listen address to prevent self-connections.
 		if m.cfg.ListenAddr != "" {
 			_, listenPort, _ := net.SplitHostPort(m.cfg.ListenAddr)
