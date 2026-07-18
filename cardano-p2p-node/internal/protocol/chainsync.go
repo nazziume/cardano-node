@@ -239,13 +239,25 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, lo
 				// Any rollback to genesis from a peer while our store is already well
 				// ahead indicates a stale/slow peer.  Close this peer's session so
 				// the peer manager can reconnect and find a proper intersection.
-				currentTip, _ := store.Tip()
-				const deepRollbackThreshold = uint64(1000) // ~1000 slots ≈ first few minutes
+				currentTip, currentBlock := store.Tip()
+				const deepRollbackThreshold = uint64(1000)
+				const blockLeadThreshold = uint64(10) // peer must be >10 blocks ahead to justify genesis rollback
 				if rollPt.IsOrigin() && currentTip.SlotNo > deepRollbackThreshold {
-					log.Warn("chainsync client: refusing genesis rollback, closing session to reconnect",
-						zap.Uint64("store_tip_slot", currentTip.SlotNo),
-						zap.Uint64("peer_tip_block", tipBlockNo))
-					return nil // peer manager will reconnect after delay
+					if tipBlockNo > currentBlock+blockLeadThreshold {
+						// Peer is significantly ahead → we're likely on an abandoned fork.
+						// Accept rollback to resync on the canonical chain.
+						log.Warn("chainsync client: accepting genesis rollback (fork recovery)",
+							zap.Uint64("store_tip_slot", currentTip.SlotNo),
+							zap.Uint64("store_block", currentBlock),
+							zap.Uint64("peer_tip_block", tipBlockNo))
+					} else {
+						// Peer is at roughly the same height → concurrent genesis rollback.
+						// Close session; reconnect will find intersection without wiping store.
+						log.Warn("chainsync client: refusing genesis rollback, closing session",
+							zap.Uint64("store_tip_slot", currentTip.SlotNo),
+							zap.Uint64("peer_tip_block", tipBlockNo))
+						return nil
+					}
 				}
 
 				log.Info("chainsync client: rollback",
