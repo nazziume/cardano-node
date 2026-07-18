@@ -326,6 +326,14 @@ func (m *Manager) onNewPeers(peers []protocol.PeerAddress) {
 	m.mu.Lock()
 	for _, p := range peers {
 		addr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+		// Skip our own listen address to prevent self-connections.
+		if m.cfg.ListenAddr != "" {
+			_, listenPort, _ := net.SplitHostPort(m.cfg.ListenAddr)
+			_, peerPort, _ := net.SplitHostPort(addr)
+			if listenPort == peerPort {
+				continue // same port → almost certainly us
+			}
+		}
 		if !m.knownAddrs[addr] {
 			m.knownAddrs[addr] = true
 			addrs = append(addrs, addr)

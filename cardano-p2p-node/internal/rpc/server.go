@@ -27,12 +27,13 @@ import (
 	"github.com/cardano-p2p-node/internal/peer"
 )
 
-// PoolWriter extends PoolSource with the ability to add transactions directly
-// and query statistics. Implemented by *mempool.Mempool.
+// PoolWriter extends PoolSource with all mutation and query operations.
+// Implemented by *mempool.Mempool.
 type PoolWriter interface {
 	PoolSource
 	Add(e *mempool.TxEntry) bool
 	GetStats() mempool.Stats
+	RemoveConfirmed(txids []mempool.TxID) int
 }
 
 // ConnSource is implemented by the peer manager.
@@ -82,6 +83,7 @@ func New(addr string, conns ConnSource, pool PoolWriter, getTip func() (uint64, 
 	mux.HandleFunc("/mempool", s.handleMempool)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/debug/inject", s.handleDebugInject)
+	mux.HandleFunc("/debug/confirm", s.handleDebugConfirm)
 
 	s.httpSrv = &http.Server{
 		Addr:         addr,
@@ -411,6 +413,45 @@ func (s *Server) handleDebugInject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, injectResponse{
 		Injected: len(injected),
 		TxIDs:    injected,
+	})
+}
+
+// ── /debug/confirm ────────────────────────────────────────────────────────────
+
+// handleDebugConfirm simulates a block arriving that contains the given txids.
+// It calls pool.RemoveConfirmed(), exactly as BlockFetchClient would after
+// parsing a real Cardano block. Accepts a JSON body: {"txids": ["hex", ...]}.
+func (s *Server) handleDebugConfirm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		TxIDs []string `json:"txids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ids := make([]mempool.TxID, 0, len(req.TxIDs))
+	var invalid []string
+	for _, hexID := range req.TxIDs {
+		b, err := hex.DecodeString(hexID)
+		if err != nil {
+			invalid = append(invalid, hexID)
+			continue
+		}
+		ids = append(ids, mempool.TxID(b))
+	}
+
+	removed := s.pool.RemoveConfirmed(ids)
+
+	writeJSON(w, map[string]interface{}{
+		"confirmed": removed,
+		"invalid":   invalid,
+		"remaining": s.pool.Size(),
 	})
 }
 

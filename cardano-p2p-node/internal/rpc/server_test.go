@@ -38,12 +38,27 @@ type mockPool struct {
 	txs []*mempool.TxEntry
 }
 
-func (m *mockPool) GetAll() []*mempool.TxEntry    { return m.txs }
-func (m *mockPool) Size() int                      { return len(m.txs) }
-func (m *mockPool) GetStats() mempool.Stats        { return mempool.Stats{Added: uint64(len(m.txs))} }
+func (m *mockPool) GetAll() []*mempool.TxEntry { return m.txs }
+func (m *mockPool) Size() int                  { return len(m.txs) }
+func (m *mockPool) GetStats() mempool.Stats    { return mempool.Stats{Added: uint64(len(m.txs))} }
 func (m *mockPool) Add(e *mempool.TxEntry) bool {
 	m.txs = append(m.txs, e)
 	return true
+}
+func (m *mockPool) RemoveConfirmed(ids []mempool.TxID) int {
+	before := len(m.txs)
+	keep := m.txs[:0]
+	rm := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		rm[id.String()] = true
+	}
+	for _, e := range m.txs {
+		if !rm[e.ID.String()] {
+			keep = append(keep, e)
+		}
+	}
+	m.txs = keep
+	return before - len(m.txs)
 }
 
 func freePort(t *testing.T) string {

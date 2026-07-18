@@ -84,14 +84,14 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 			_ = cbor.Unmarshal(msg[2], &ackCount)
 			_ = cbor.Unmarshal(msg[3], &reqCount)
 
-			// Remove acknowledged txids from our pending list.
-			// They can now be dropped from our tracking.
+			// Advance past the acknowledged txids.
+			// Acknowledged txids STAY in `announced` — once a peer has processed
+			// a txid (either fetched the tx or decided not to), we must never
+			// re-announce it on this connection.  Removing them caused the bug
+			// where the first 10 txs were re-sent instead of the next 2.
 			n := int(ackCount)
 			if n > len(pendingAck) {
 				n = len(pendingAck)
-			}
-			for _, key := range pendingAck[:n] {
-				delete(announced, key)
 			}
 			pendingAck = pendingAck[n:]
 
