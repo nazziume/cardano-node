@@ -37,20 +37,40 @@ const (
 func ChainSyncClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoChainSync)
 
-	// Build intersection candidates from our known recent headers.
-	// We propose our current tip; the upstream will find where we diverge.
-	// We do NOT include origin: starting from genesis would force the upstream
-	// to replay the entire blockchain history (millions of headers).
-	// If no intersection is found, the upstream will tell us and we'll
-	// drain forward at full speed until we reach the current tip.
-	currentTip, _ := store.Tip()
+	// Build intersection candidates using exponential-backoff sampling of
+	// our known recent headers. Sending only the tip is fragile: if the tip
+	// block arrived after the peer's latest view (e.g. a 1-block micro-fork),
+	// the intersection fails and the peer rolls us ALL THE WAY back to origin,
+	// forcing a full re-sync from genesis.
+	//
+	// Sending candidates at depths 0, 1, 2, 4, 8, 16, 32, 64, 128 gives the
+	// peer many chances to find a common ancestor within the last 256 blocks.
+	// Cardano clients may send up to 96 candidates; we use at most ~10.
+	headers := store.AllHeaders()
 	var candidates []interface{}
-	if !currentTip.IsOrigin() {
-		candidates = append(candidates, encodePoint(currentTip))
+	if len(headers) > 0 {
+		seen := make(map[int]bool)
+		depth := 0
+		for depth < len(headers) {
+			idx := len(headers) - 1 - depth
+			if !seen[idx] {
+				seen[idx] = true
+				candidates = append(candidates, encodePoint(headers[idx].Point))
+			}
+			if depth == 0 {
+				depth = 1
+			} else {
+				depth *= 2
+			}
+		}
+		// Always include the oldest available header as a final fallback.
+		if !seen[0] {
+			candidates = append(candidates, encodePoint(headers[0].Point))
+		}
 	} else {
-		// No known tip yet. Propose origin so the upstream starts from
-		// the beginning and we fast-forward to the tip.
-		// Headers before our ring fills up are discarded by the store.
+		// No known headers yet: propose origin so the upstream starts from
+		// genesis and we fast-forward. Headers are small (~500 B each) so
+		// this is fast even for a chain with millions of blocks.
 		candidates = append(candidates, encodeOrigin())
 	}
 
