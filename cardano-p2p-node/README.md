@@ -97,12 +97,12 @@ Edit `config.yaml`:
 network: mainnet
 
 # Listen for inbound connections (the more inbound peers, the better our scores)
-listenAddr: "0.0.0.0:3000"
+listenAddr: "0.0.0.0:3001"
 
 # Well-known upstream peers to maintain persistent connections to
 staticPeers:
   - "backbone.cardano-mainnet.iohk.io:3001"
-  - "backbone.mainnet.emurgornd.com:3000"
+  - "backbone.mainnet.emurgornd.com:3001"
   - "backbone.mainnet.cardanofoundation.org:3001"
 
 # Accept up to 50 inbound connections

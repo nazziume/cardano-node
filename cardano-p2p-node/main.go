@@ -65,7 +65,7 @@ func boolPtr(b bool) *bool { return &b }
 func defaultConfig() Config {
 	return Config{
 		Network:        "mainnet",
-		ListenAddr:     "0.0.0.0:3000",
+		ListenAddr:     "0.0.0.0:3001",
 		MaxInbound:     50,
 		MaxOutbound:    10,
 		ReconnectDelay: "10s",

@@ -5,13 +5,13 @@ network: mainnet
 
 # Local address to listen on for inbound connections.
 # Set to "" to disable inbound (outbound-only mode).
-listenAddr: "0.0.0.0:3000"
+listenAddr: "0.0.0.0:3001"
 
 # Upstream peers to always maintain persistent outbound connections to.
 # Add multiple well-known relay nodes for redundancy and lower latency.
 staticPeers:
   - "backbone.cardano-mainnet.iohk.io:3001"
-  - "backbone.mainnet.emurgornd.com:3000"
+  - "backbone.mainnet.emurgornd.com:3001"
   - "backbone.mainnet.cardanofoundation.org:3001"
 
 # ── Connection limits ─────────────────────────────────────────────────────────
