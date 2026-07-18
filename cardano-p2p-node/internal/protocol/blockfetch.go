@@ -83,8 +83,14 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, l
 
 // fetchOne requests and receives a single block identified by its exact point.
 // The server returns either MsgNoBlocks or MsgStartBatch → MsgBlock → MsgBatchDone.
-// The lenient CBOR reader is used for MsgBlock bodies because real Cardano block
-// CBOR may contain non-standard additional-info bytes (Haskell cborg extensions).
+//
+// All reads use readOneMessageLenient (not readOneMessage / cbor.NewDecoder).
+// cbor.NewDecoder wraps the mux protoBuf reader in an internal buffer, which
+// over-reads bytes beyond the decoded value and makes them inaccessible to
+// subsequent reads — corrupting the stream when MsgStartBatch (2 bytes) and
+// MsgBlock (kilobytes) arrive close together in the protoBuf.
+// readOneMessageLenient + splitLenientArray reads exactly the bytes needed and
+// also handles non-standard Haskell cborg extensions in Conway block bodies.
 func fetchOne(mc *mux.Conn, r io.Reader, store *chain.Store, pool *mempool.Mempool, h chain.Header, log *zap.Logger) error {
 	pt := encodePoint(h.Point)
 	reqMsg, _ := cbor.Marshal([]interface{}{uint8(bfTagRequestRange), pt, pt})
@@ -92,16 +98,18 @@ func fetchOne(mc *mux.Conn, r io.Reader, store *chain.Store, pool *mempool.Mempo
 		return fmt.Errorf("blockfetch request: %w", err)
 	}
 
-	raw, err := readOneMessage(r)
+	// Use lenient reader for the first response too, to avoid cbor.Decoder
+	// internal buffering that would corrupt subsequent batch message reads.
+	raw, err := readOneMessageLenient(r)
 	if err != nil {
 		return fmt.Errorf("blockfetch read response: %w", err)
 	}
-	var msg []cbor.RawMessage
-	if err := cbor.Unmarshal(raw, &msg); err != nil || len(msg) < 1 {
+	firstElems, err := splitLenientArray(raw)
+	if err != nil || len(firstElems) < 1 {
 		return fmt.Errorf("blockfetch decode response")
 	}
 	var tag uint8
-	_ = cbor.Unmarshal(msg[0], &tag)
+	_ = cbor.Unmarshal(firstElems[0], &tag)
 
 	switch tag {
 	case bfTagNoBlocks:
