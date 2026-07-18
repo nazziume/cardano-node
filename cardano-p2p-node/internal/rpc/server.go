@@ -21,6 +21,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/blake2b"
 
 	"github.com/cardano-p2p-node/internal/mempool"
 	"github.com/cardano-p2p-node/internal/peer"
@@ -387,6 +388,13 @@ func (s *Server) handleDebugInject(w http.ResponseWriter, r *http.Request) {
 			true,
 			nil,
 		})
+
+		// Compute the canonical txid = Blake2b-256(transaction_body_cbor).
+		// This matches how Cardano nodes compute txids, so real nodes won't
+		// reject us for announcing a txid that doesn't match the body.
+		h, _ := blake2b.New256(nil)
+		h.Write(bodyBytes)
+		txid = h.Sum(nil)
 
 		entry := &mempool.TxEntry{
 			ID:         mempool.TxID(txid),

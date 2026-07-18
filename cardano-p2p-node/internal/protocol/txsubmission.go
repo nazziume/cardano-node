@@ -112,17 +112,23 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 			}
 		}
 
-			// Encode txids and sizes: [[txid, size], ...]
-			txidsAndSizes := make([]interface{}, 0, len(entries))
-			for _, e := range entries {
-				txidsAndSizes = append(txidsAndSizes, []interface{}{[]byte(e.ID), e.Size})
-			}
+		// Encode txids and sizes: [[txid, size], ...]
+		txidsAndSizes := make([]interface{}, 0, len(entries))
+		for _, e := range entries {
+			txidsAndSizes = append(txidsAndSizes, []interface{}{[]byte(e.ID), e.Size})
+		}
 
-			// MsgReplyTxIds = [1, txIdsAndSizes]
-			replyMsg, _ := cbor.Marshal([]interface{}{uint8(tsTagReplyTxIds), txidsAndSizes})
-			if err := mc.Send(mux.ProtoTxSubmission, replyMsg); err != nil {
-				return fmt.Errorf("txsubmission outbound reply txids: %w", err)
-			}
+		if len(entries) > 0 {
+			log.Info("txsubmission outbound: advertising txids to peer",
+				zap.Int("count", len(entries)),
+				zap.String("first_txid", entries[0].ID.String()[:16]+"..."))
+		}
+
+		// MsgReplyTxIds = [1, txIdsAndSizes]
+		replyMsg, _ := cbor.Marshal([]interface{}{uint8(tsTagReplyTxIds), txidsAndSizes})
+		if err := mc.Send(mux.ProtoTxSubmission, replyMsg); err != nil {
+			return fmt.Errorf("txsubmission outbound reply txids: %w", err)
+		}
 
 		case tsTagRequestTxs:
 			// MsgRequestTxs = [2, txidList]
@@ -136,13 +142,19 @@ func TxSubmissionOutbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, 
 
 			// Look up and return txs
 			txList := make([]interface{}, 0, len(txidList))
+			requestedIDs := make([]string, 0, len(txidList))
 			for _, rawID := range txidList {
 				var txid []byte
 				_ = cbor.Unmarshal(rawID, &txid)
+				requestedIDs = append(requestedIDs, mempool.TxID(txid).String()[:16]+"...")
 				if e, ok := pool.Get(mempool.TxID(txid)); ok {
 					txList = append(txList, e.Raw)
 				}
 			}
+			log.Info("txsubmission outbound: peer requested tx bodies",
+				zap.Int("requested", len(txidList)),
+				zap.Int("found_in_pool", len(txList)),
+				zap.Strings("txids", requestedIDs))
 
 			// MsgReplyTxs = [3, txList]
 			replyMsg, _ := cbor.Marshal([]interface{}{uint8(tsTagReplyTxs), txList})

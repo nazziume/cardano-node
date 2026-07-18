@@ -3,6 +3,7 @@ package protocol
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
@@ -71,6 +72,9 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, l
 		}
 
 		// Group consecutive missing headers into ranges and batch-fetch each.
+		// If a batch fails (e.g. non-standard CBOR in a real Cardano block),
+		// send MsgClientDone and pause so ChainSync / TxSubmission stay up.
+		batchFailed := false
 		for _, run := range groupIntoRuns(missing) {
 			select {
 			case <-done:
@@ -78,7 +82,22 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, pool *mempool.Mempool, l
 			default:
 			}
 			if err := fetchRange(mc, r, store, pool, run, log); err != nil {
-				return err
+				log.Warn("blockfetch client: batch error (non-standard CBOR?), pausing",
+					zap.Error(err),
+					zap.Uint64("from_slot", run[0].Point.SlotNo))
+				batchFailed = true
+				break
+			}
+		}
+		if batchFailed {
+			// Gracefully end just the BlockFetch session; other protocols continue.
+			_ = sendBlockFetchDone(mc)
+			// Wait before retrying to avoid hammering the peer.
+			select {
+			case <-done:
+				return nil
+			case <-time.After(30 * time.Second):
+			case <-newHeaderCh: // new header arrived — retry sooner
 			}
 		}
 	}
@@ -143,19 +162,28 @@ func fetchRange(mc *mux.Conn, r io.Reader, store *chain.Store, pool *mempool.Mem
 		log.Debug("blockfetch client: no blocks in range",
 			zap.Uint64("from", run[0].Point.SlotNo),
 			zap.Uint64("to", run[len(run)-1].Point.SlotNo))
-	case bfTagStartBatch:
-		// Stream all blocks from the batch into the store immediately.
-		// We use run as a slot-ordered index to assign the right Point to each block.
-		idx := 0
-		for {
-			raw, err := readOneMessage(r)
-			if err != nil {
-				return fmt.Errorf("blockfetch client read batch: %w", err)
-			}
-			var bMsg []cbor.RawMessage
-			if err := cbor.Unmarshal(raw, &bMsg); err != nil {
-				continue
-			}
+		case bfTagStartBatch:
+			// Stream all blocks from the batch into the store immediately.
+			// We use run as a slot-ordered index to assign the right Point to each block.
+			// Use the lenient reader here because real Cardano block CBOR may contain
+			// non-standard additional-info values (28–30) from the Haskell cborg library
+			// that the strict RFC-8949 decoder rejects.
+			idx := 0
+			for {
+				raw, err := readOneMessageLenient(r)
+				if err != nil {
+					return fmt.Errorf("blockfetch client read batch: %w", err)
+				}
+				var bMsg []cbor.RawMessage
+				if err := cbor.Unmarshal(raw, &bMsg); err != nil {
+					// If the outer array itself can't be decoded, try a strict read
+					// to see if it's a simple MsgBatchDone / MsgNoBlocks.
+					var bTagOnly []cbor.RawMessage
+					if err2 := cbor.Unmarshal(raw, &bTagOnly); err2 != nil {
+						continue
+					}
+					bMsg = bTagOnly
+				}
 			if len(bMsg) < 1 {
 				continue
 			}
