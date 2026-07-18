@@ -320,9 +320,10 @@ func TxSubmissionInbound(mc *mux.Conn, pool *mempool.Mempool, log *zap.Logger, d
 				txid = wantEntry
 			}
 			entry := &mempool.TxEntry{
-				ID:   mempool.TxID(txid),
-				Size: uint32(len(rawTx)),
-				Raw:  rawTx,
+				ID:       mempool.TxID(txid),
+				Size:     uint32(len(rawTx)),
+				Raw:      rawTx,
+				FromPeer: mc.Underlying().RemoteAddr().String(),
 			}
 			if pool.Add(entry) {
 				newCount++

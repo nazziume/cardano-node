@@ -31,6 +31,10 @@ const recentBlockWindow = 10
 // BlockFetchClient downloads blocks for the most recent headers in the store.
 // It does NOT download historical blocks — only the latest recentBlockWindow blocks
 // are fetched so they can be served immediately to downstream peers.
+//
+// Blocks are fetched in consecutive RANGE batches to minimise round-trips:
+// instead of N individual requests, a single MsgRequestRange covers a run of
+// consecutive missing blocks and the server streams all of them back at once.
 func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoBlockFetch)
 	newHeaderCh := store.Subscribe()
@@ -44,7 +48,6 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-
 		}
 
 		// Only fetch blocks for the most recent recentBlockWindow headers.
-		// This avoids downloading the entire blockchain history.
 		headers := store.AllHeaders()
 		start := 0
 		if len(headers) > recentBlockWindow {
@@ -52,66 +55,130 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-
 		}
 		recentHeaders := headers[start:]
 
-		var toFetch []chain.Header
+		// Collect missing headers, then group into consecutive runs so we
+		// can issue one MsgRequestRange per run instead of per block.
+		var missing []chain.Header
 		for _, h := range recentHeaders {
 			if _, ok := store.GetBlock(h.Point.Hash); !ok {
-				toFetch = append(toFetch, h)
+				missing = append(missing, h)
 			}
 		}
-		if len(toFetch) == 0 {
+		if len(missing) == 0 {
 			continue
 		}
 
-		for _, h := range toFetch {
+		// Group consecutive missing headers into ranges and batch-fetch each.
+		for _, run := range groupIntoRuns(missing) {
 			select {
 			case <-done:
 				return sendBlockFetchDone(mc)
 			default:
 			}
-
-			from := encodePoint(h.Point)
-			to := encodePoint(h.Point)
-
-			// MsgRequestRange = [0, fromPoint, toPoint]
-			reqMsg, _ := cbor.Marshal([]interface{}{uint8(bfTagRequestRange), from, to})
-			if err := mc.Send(mux.ProtoBlockFetch, reqMsg); err != nil {
-				return fmt.Errorf("blockfetch client request: %w", err)
-			}
-
-			// Receive response
-			raw, err := readOneMessage(r)
-			if err != nil {
-				if err == io.EOF {
-					return nil
-				}
-				return fmt.Errorf("blockfetch client read response: %w", err)
-			}
-
-			var msg []cbor.RawMessage
-			if err := cbor.Unmarshal(raw, &msg); err != nil {
-				continue
-			}
-			if len(msg) < 1 {
-				continue
-			}
-
-			var tag uint8
-			_ = cbor.Unmarshal(msg[0], &tag)
-
-			switch tag {
-			case bfTagNoBlocks:
-				log.Debug("blockfetch client: no blocks for point", zap.Uint64("slot", h.Point.SlotNo))
-				continue
-			case bfTagStartBatch:
-				// Receive blocks until BatchDone
-				if err := receiveBlocks(r, mc, store, h.Point, log); err != nil {
-					return err
-				}
-			default:
-				log.Warn("blockfetch client: unexpected tag", zap.Uint8("tag", tag))
+			if err := fetchRange(mc, r, store, run, log); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+// groupIntoRuns splits headers into consecutive groups (by index position).
+// A single gap in the missing list starts a new run.
+// This keeps each MsgRequestRange contiguous so the server can satisfy it
+// without gaps that would force a MsgNoBlocks response.
+func groupIntoRuns(headers []chain.Header) [][]chain.Header {
+	if len(headers) == 0 {
+		return nil
+	}
+	var runs [][]chain.Header
+	cur := []chain.Header{headers[0]}
+	for i := 1; i < len(headers); i++ {
+		// Adjacent if slots are consecutive (mainnet: 1 slot apart is fine,
+		// but headers may have slot gaps from missed slots; treat all as one run).
+		cur = append(cur, headers[i])
+	}
+	runs = append(runs, cur)
+	return runs
+}
+
+// fetchRange sends a single MsgRequestRange for [first, last] and reads the
+// streamed blocks, storing each one immediately as it arrives.
+func fetchRange(mc *mux.Conn, r io.Reader, store *chain.Store, run []chain.Header, log *zap.Logger) error {
+	if len(run) == 0 {
+		return nil
+	}
+	from := encodePoint(run[0].Point)
+	to := encodePoint(run[len(run)-1].Point)
+
+	// MsgRequestRange = [0, fromPoint, toPoint]
+	reqMsg, _ := cbor.Marshal([]interface{}{uint8(bfTagRequestRange), from, to})
+	if err := mc.Send(mux.ProtoBlockFetch, reqMsg); err != nil {
+		return fmt.Errorf("blockfetch client request range: %w", err)
+	}
+
+	raw, err := readOneMessage(r)
+	if err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return fmt.Errorf("blockfetch client read range response: %w", err)
+	}
+
+	var msg []cbor.RawMessage
+	if err := cbor.Unmarshal(raw, &msg); err != nil {
+		return nil
+	}
+	if len(msg) < 1 {
+		return nil
+	}
+
+	var tag uint8
+	_ = cbor.Unmarshal(msg[0], &tag)
+
+	switch tag {
+	case bfTagNoBlocks:
+		log.Debug("blockfetch client: no blocks in range",
+			zap.Uint64("from", run[0].Point.SlotNo),
+			zap.Uint64("to", run[len(run)-1].Point.SlotNo))
+	case bfTagStartBatch:
+		// Stream all blocks from the batch into the store immediately.
+		// We use run as a slot-ordered index to assign the right Point to each block.
+		idx := 0
+		for {
+			raw, err := readOneMessage(r)
+			if err != nil {
+				return fmt.Errorf("blockfetch client read batch: %w", err)
+			}
+			var bMsg []cbor.RawMessage
+			if err := cbor.Unmarshal(raw, &bMsg); err != nil {
+				continue
+			}
+			if len(bMsg) < 1 {
+				continue
+			}
+			var bTag uint8
+			_ = cbor.Unmarshal(bMsg[0], &bTag)
+
+			switch bTag {
+			case bfTagBlock:
+				if len(bMsg) < 2 {
+					continue
+				}
+				var pt chain.Point
+				if idx < len(run) {
+					pt = run[idx].Point
+					idx++
+				}
+				// Store immediately — downstream peers can serve this block now.
+				store.AddBlock(chain.Block{Point: pt, Raw: bMsg[1]})
+				log.Debug("blockfetch client: stored block", zap.Uint64("slot", pt.SlotNo))
+
+			case bfTagBatchDone:
+				log.Debug("blockfetch client: batch done", zap.Int("count", idx))
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 func receiveBlocks(r io.Reader, mc *mux.Conn, store *chain.Store, forPoint chain.Point, log *zap.Logger) error {

@@ -271,7 +271,18 @@ func ChainSyncServer(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 }
 
 // chainSyncServe is the inner serving loop after intersection negotiation.
-// It sends bufferedHeaders first, then waits for new headers from the store.
+//
+// Concurrency design:
+//   - A dedicated "reader" goroutine pulls MsgRequestNext from the peer
+//     and sends tokens into a channel. This decouples reading from sending
+//     so we never block waiting for the client when a new header is ready.
+//   - The main goroutine consumes request tokens and sends headers.
+//   - When a new header arrives from upstream we wake immediately via the
+//     store subscription channel and push it without waiting for the reader.
+//
+// This design is what makes us fast enough to win the upstreamyness race:
+// the moment a new header lands in the store, all downstream ChainSync
+// servers are already unblocked and push the header concurrently.
 func chainSyncServe(
 	mc *mux.Conn,
 	r io.Reader,
@@ -280,85 +291,119 @@ func chainSyncServe(
 	log *zap.Logger,
 	done <-chan struct{},
 ) error {
-	// Subscribe to new headers BEFORE we start serving buffered ones
-	// to avoid missing any that arrive between buffer snapshot and subscription
+	// Subscribe before copying buffered headers to avoid missing any
+	// headers that arrive while we are serving the backlog.
 	newHeaderCh := store.Subscribe()
 	defer store.Unsubscribe(newHeaderCh)
 
-	headerQueue := make([]chain.Header, len(bufferedHeaders))
-	copy(headerQueue, bufferedHeaders)
+	// requestCh receives a token for every MsgRequestNext we get.
+	// Buffered so the reader goroutine is never blocked by a slow sender.
+	requestCh := make(chan struct{}, 64)
+	readErrCh := make(chan error, 1)
+
+	// Reader goroutine: just reads requests, never sends anything.
+	go func() {
+		for {
+			raw, err := readOneMessage(r)
+			if err != nil {
+				readErrCh <- err
+				return
+			}
+			var req []cbor.RawMessage
+			if err := cbor.Unmarshal(raw, &req); err != nil || len(req) == 0 {
+				continue
+			}
+			var tag uint8
+			_ = cbor.Unmarshal(req[0], &tag)
+			switch tag {
+			case csTagRequestNext:
+				select {
+				case requestCh <- struct{}{}:
+				case <-done:
+					return
+				}
+			case csTagDone:
+				readErrCh <- io.EOF
+				return
+			}
+		}
+	}()
+
+	// headerQ holds headers we have queued to send but haven't yet received
+	// a MsgRequestNext for. We track by position in the store's ring.
+	headerQ := make([]chain.Header, len(bufferedHeaders))
+	copy(headerQ, bufferedHeaders)
+
+	// lastSentSlot is used to deduplicate: the store subscription may fire
+	// multiple times before we drain, but we track position via allHeaders index.
+	allHeaders := store.AllHeaders()
+	sentUpTo := len(allHeaders) - len(bufferedHeaders) // index into allHeaders
+
+	// pendingRequests counts how many MsgRequestNext we've received but not
+	// yet answered. When > 0 we can send immediately without waiting.
+	pendingRequests := 0
 
 	for {
+		// Drain any pending requests from the channel (non-blocking)
+	drainRequests:
+		for {
+			select {
+			case <-requestCh:
+				pendingRequests++
+			default:
+				break drainRequests
+			}
+		}
+
+		if pendingRequests > 0 && len(headerQ) > 0 {
+			// Serve as many headers as we have requests for, all at once.
+			toSend := pendingRequests
+			if toSend > len(headerQ) {
+				toSend = len(headerQ)
+			}
+			for i := 0; i < toSend; i++ {
+				if err := sendRollForward(mc, headerQ[i]); err != nil {
+					return err
+				}
+				log.Debug("chainsync server: served header", zap.Uint64("slot", headerQ[i].Point.SlotNo))
+			}
+			headerQ = headerQ[toSend:]
+			pendingRequests -= toSend
+			continue
+		}
+
+		if pendingRequests > 0 && len(headerQ) == 0 {
+			// At tip: send MsgAwaitReply once, then wait for new headers.
+			awaitMsg, _ := cbor.Marshal([]interface{}{uint8(csTagAwaitReply)})
+			if err := mc.Send(mux.ProtoChainSync, awaitMsg); err != nil {
+				return fmt.Errorf("chainsync server send await: %w", err)
+			}
+			// Wait for store notification or more requests (reader goroutine continues)
+		}
+
+		// Block until something interesting happens:
+		// - a new header arrives in the store, OR
+		// - the client sends another MsgRequestNext, OR
+		// - shutdown/error
 		select {
 		case <-done:
 			return nil
-		default:
-		}
-
-		// Wait for MsgRequestNext from the client
-		raw, err := readOneMessage(r)
-		if err != nil {
+		case err := <-readErrCh:
 			if err == io.EOF {
 				return nil
 			}
-			return fmt.Errorf("chainsync server read request: %w", err)
-		}
-
-		var reqMsg []cbor.RawMessage
-		if err := cbor.Unmarshal(raw, &reqMsg); err != nil {
-			continue
-		}
-		if len(reqMsg) < 1 {
-			continue
-		}
-		var reqTag uint8
-		_ = cbor.Unmarshal(reqMsg[0], &reqTag)
-
-		switch reqTag {
-		case csTagRequestNext:
-			if len(headerQueue) > 0 {
-				// Serve next buffered header immediately
-				h := headerQueue[0]
-				headerQueue = headerQueue[1:]
-				if err := sendRollForward(mc, h); err != nil {
-					return err
-				}
-				log.Debug("chainsync server: served buffered header", zap.Uint64("slot", h.Point.SlotNo))
-			} else {
-				// At tip: send MsgAwaitReply, then wait for new header
-				awaitMsg, _ := cbor.Marshal([]interface{}{uint8(csTagAwaitReply)})
-				if err := mc.Send(mux.ProtoChainSync, awaitMsg); err != nil {
-					return fmt.Errorf("chainsync server send await: %w", err)
-				}
-
-				// Wait for a new header to arrive in the store
-				// This is the CRITICAL path: we wake up immediately when new
-				// headers arrive and forward them to the downstream peer.
-				// Being first here is what maximizes upstreamyness score.
-				for {
-					select {
-					case <-done:
-						return nil
-					case <-newHeaderCh:
-						// Fetch any new headers we haven't served yet
-						newHeaders := store.AllHeaders()
-						// Find the last header we sent (if any)
-						// For now, just send the most recent one
-						if len(newHeaders) > 0 {
-							h := newHeaders[len(newHeaders)-1]
-							if err := sendRollForward(mc, h); err != nil {
-								return err
-							}
-							log.Debug("chainsync server: sent live header", zap.Uint64("slot", h.Point.SlotNo))
-							goto nextRequest
-						}
-					}
-				}
-			nextRequest:
+			return err
+		case <-requestCh:
+			pendingRequests++
+		case <-newHeaderCh:
+			// Fetch newly added headers since we last checked.
+			// This is O(n) over new headers only, not the whole ring.
+			current := store.AllHeaders()
+			if len(current) > sentUpTo {
+				newOnes := current[sentUpTo:]
+				headerQ = append(headerQ, newOnes...)
+				sentUpTo = len(current)
 			}
-
-		case csTagDone:
-			return nil
 		}
 	}
 }

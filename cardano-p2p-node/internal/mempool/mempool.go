@@ -4,6 +4,7 @@ package mempool
 import (
 	"encoding/hex"
 	"sync"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -13,20 +14,26 @@ type TxID []byte
 
 func (id TxID) String() string { return hex.EncodeToString(id) }
 
-// TxEntry holds a transaction and its size.
+// TxEntry holds a transaction and its metadata.
 type TxEntry struct {
-	ID   TxID
-	Size uint32
-	Raw  cbor.RawMessage
+	ID          TxID
+	Size        uint32
+	Raw         cbor.RawMessage
+	ReceivedAt  time.Time // when we added this tx (UTC)
+	FromPeer    string    // remote addr of the peer that provided this tx
 }
 
 // Mempool is a thread-safe in-memory transaction pool.
-// It maintains insertion order for serving in FIFO order.
+// Transactions are stored in insertion order (FIFO) for serving peers.
 type Mempool struct {
 	mu      sync.RWMutex
 	txs     map[string]*TxEntry // txid hex → entry
-	order   []string            // insertion order
+	order   []string            // insertion order (txid hex)
 	maxSize int
+
+	// onAdd is called (in the calling goroutine) when a new tx is added.
+	// Used for logging; must be non-blocking.
+	onAdd func(*TxEntry)
 
 	// Subscribers waiting for new transactions
 	subsMu sync.Mutex
@@ -43,7 +50,16 @@ func New() *Mempool {
 	}
 }
 
+// SetOnAdd installs a hook called synchronously whenever a new transaction
+// is added. Must not block. Pass nil to remove.
+func (m *Mempool) SetOnAdd(fn func(*TxEntry)) {
+	m.mu.Lock()
+	m.onAdd = fn
+	m.mu.Unlock()
+}
+
 // Add adds a transaction to the pool. Returns true if it was new.
+// fromPeer identifies which peer provided this transaction (for logging).
 func (m *Mempool) Add(entry *TxEntry) bool {
 	key := entry.ID.String()
 	m.mu.Lock()
@@ -51,6 +67,9 @@ func (m *Mempool) Add(entry *TxEntry) bool {
 
 	if _, exists := m.txs[key]; exists {
 		return false
+	}
+	if entry.ReceivedAt.IsZero() {
+		entry.ReceivedAt = time.Now().UTC()
 	}
 
 	// Evict oldest if at capacity
@@ -62,6 +81,11 @@ func (m *Mempool) Add(entry *TxEntry) bool {
 
 	m.txs[key] = entry
 	m.order = append(m.order, key)
+
+	// Call hook while still holding the lock so the caller sees a consistent view.
+	if m.onAdd != nil {
+		m.onAdd(entry)
+	}
 
 	// Notify subscribers
 	m.subsMu.Lock()
@@ -92,8 +116,21 @@ func (m *Mempool) Get(id TxID) (*TxEntry, bool) {
 	return e, ok
 }
 
+// GetAll returns a snapshot of all transactions in insertion order.
+func (m *Mempool) GetAll() []*TxEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*TxEntry, 0, len(m.order))
+	for _, key := range m.order {
+		if e, ok := m.txs[key]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // TxIDsAfter returns up to n txids that come after the given index.
-// Index 0 means start from the beginning.
 // Returns the txids and the new index to continue from.
 func (m *Mempool) TxIDsAfter(afterIdx int, n int) ([]*TxEntry, int) {
 	m.mu.RLock()
@@ -114,7 +151,6 @@ func (m *Mempool) TxIDsAfter(afterIdx int, n int) ([]*TxEntry, int) {
 			result = append(result, e)
 		}
 	}
-
 	return result, end
 }
 

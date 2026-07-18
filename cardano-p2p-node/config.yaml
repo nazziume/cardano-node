@@ -1,30 +1,47 @@
 # Cardano P2P Node Configuration
-#
+
 # network: mainnet | preview | preprod | sanchonet
 network: mainnet
 
-# Local address to listen on for inbound connections
-# Set to empty string to disable inbound connections
+# Local address to listen on for inbound connections.
+# Set to "" to disable inbound (outbound-only mode).
 listenAddr: "0.0.0.0:3000"
 
-# Static upstream peers to always maintain connections to
-# These are the nodes we pull headers and blocks from.
-# Connect to well-known relays or SPO nodes for best performance.
+# Upstream peers to always maintain persistent outbound connections to.
+# Add multiple well-known relay nodes for redundancy and lower latency.
 staticPeers:
-  # Example mainnet public relays (replace with fast peers near you)
   - "backbone.cardano-mainnet.iohk.io:3001"
   - "backbone.mainnet.emurgornd.com:3000"
   - "backbone.mainnet.cardanofoundation.org:3001"
 
-# Maximum number of inbound connections
-# Higher values = more peers score us highly = better reputation
+# ── Connection limits ─────────────────────────────────────────────────────────
+# Maximum simultaneous inbound connections.
+# More inbound peers means more chances to build upstreamyness/fetchyness scores.
+# Each connection uses ~2 MB of RAM at steady state.
 maxInbound: 50
 
-# Maximum number of maintained outbound connections
+# Maximum simultaneous outbound connections.
+# Keep this proportional to the number of staticPeers.
 maxOutbound: 10
 
-# Delay before reconnecting to a lost peer
+# How long to wait before reconnecting to a lost outbound peer.
 reconnectDelay: "10s"
 
+# ── RPC server ────────────────────────────────────────────────────────────────
+# Bind address for the HTTP query interface.
+# Set to "" to disable RPC.
+#
+# Endpoints:
+#   GET /status  → connection list (ip, port, direction, uptime, connected_at JST)
+#   GET /mempool → all transactions (txid, size, from_peer, received_at JST, raw hex)
+#   GET /health  → 200 OK liveness probe
+rpcAddr: "127.0.0.1:8888"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 # Logging level: debug | info | warn | error
+# All timestamps are in UTC+9 (JST).
+# Events logged automatically:
+#   - Inbound/outbound connections (ip, port, connected_at JST)
+#   - New mempool transactions (txid, size, from_peer, received_at JST)
+#   - Chain tip progress during fast-forward and live relay
 logLevel: "info"
