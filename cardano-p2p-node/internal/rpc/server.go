@@ -2,23 +2,36 @@
 //
 // Endpoints:
 //
-//	GET /status  — current connection list (inbound + outbound) with IP, port, direction, uptime
-//	GET /mempool — all transactions currently in the mempool with metadata
-//	GET /health  — simple liveness probe (returns 200 OK)
+//	GET  /status        — current connection list (inbound + outbound) with IP, port, direction, uptime
+//	GET  /mempool       — all transactions currently in the mempool with metadata
+//	GET  /health        — simple liveness probe (returns 200 OK)
+//	POST /debug/inject  — inject N fake test transactions into the local mempool
+//	                      query param: count=N (default 1, max 1000)
 package rpc
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
 
 	"github.com/cardano-p2p-node/internal/mempool"
 	"github.com/cardano-p2p-node/internal/peer"
 )
+
+// PoolWriter extends PoolSource with the ability to add transactions directly.
+// Implemented by *mempool.Mempool.
+type PoolWriter interface {
+	PoolSource
+	Add(e *mempool.TxEntry) bool
+}
 
 // ConnSource is implemented by the peer manager.
 type ConnSource interface {
@@ -46,14 +59,14 @@ type tipAdapter struct {
 type Server struct {
 	addr    string
 	conns   ConnSource
-	pool    PoolSource
+	pool    PoolWriter
 	getTip  func() (uint64, uint64)
 	log     *zap.Logger
 	httpSrv *http.Server
 }
 
 // New creates a new RPC Server.
-func New(addr string, conns ConnSource, pool PoolSource, getTip func() (uint64, uint64), log *zap.Logger) *Server {
+func New(addr string, conns ConnSource, pool PoolWriter, getTip func() (uint64, uint64), log *zap.Logger) *Server {
 	s := &Server{
 		addr:   addr,
 		conns:  conns,
@@ -66,6 +79,7 @@ func New(addr string, conns ConnSource, pool PoolSource, getTip func() (uint64, 
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/mempool", s.handleMempool)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/debug/inject", s.handleDebugInject)
 
 	s.httpSrv = &http.Server{
 		Addr:         addr,
@@ -188,6 +202,66 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// ── /debug/inject ─────────────────────────────────────────────────────────────
+
+type injectResponse struct {
+	Injected int      `json:"injected"`
+	TxIDs    []string `json:"txids"`
+}
+
+func (s *Server) handleDebugInject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	countStr := r.URL.Query().Get("count")
+	count := 1
+	if countStr != "" {
+		if n, err := strconv.Atoi(countStr); err == nil && n > 0 && n <= 1000 {
+			count = n
+		}
+	}
+
+	var injected []string
+	for i := 0; i < count; i++ {
+		// Random 32-byte txid
+		txid := make([]byte, 32)
+		if _, err := rand.Read(txid); err != nil {
+			http.Error(w, "rand failed", http.StatusInternalServerError)
+			return
+		}
+
+		// Minimal fake Cardano-ish transaction body as CBOR:
+		// A map with a few fields that look plausible
+		fakeTx, _ := cbor.Marshal(map[interface{}]interface{}{
+			0: []interface{}{ // inputs (empty)
+			},
+			1: []interface{}{ // outputs (empty)
+			},
+			2: i * 1000000, // fee in lovelace (fake)
+			// tag the tx with an index so each is unique
+			999: fmt.Sprintf("test-tx-%d-%s", i, hex.EncodeToString(txid[:4])),
+		})
+
+		entry := &mempool.TxEntry{
+			ID:         mempool.TxID(txid),
+			Size:       uint32(len(fakeTx)),
+			Raw:        cbor.RawMessage(fakeTx),
+			FromPeer:   "debug/inject",
+			ReceivedAt: time.Now().UTC(),
+		}
+		if s.pool.Add(entry) {
+			injected = append(injected, hex.EncodeToString(txid))
+		}
+	}
+
+	writeJSON(w, injectResponse{
+		Injected: len(injected),
+		TxIDs:    injected,
+	})
+}
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
