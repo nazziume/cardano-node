@@ -34,6 +34,11 @@ var jst = time.FixedZone("CST", 8*60*60)
 type Config struct {
 	Network        string   `yaml:"network"`
 	ListenAddr     string   `yaml:"listenAddr"`
+	// AdvertiseAddr is the public host:port to include in PeerSharing responses.
+	// Set this to your server's public IP and listen port so other nodes that
+	// ask us for peers can discover and connect back to us as inbound peers.
+	// Example: "167.17.47.5:3001"
+	AdvertiseAddr  string   `yaml:"advertiseAddr"`
 	StaticPeers    []string `yaml:"staticPeers"`
 	MaxInbound     int      `yaml:"maxInbound"`
 	MaxOutbound    int      `yaml:"maxOutbound"`
@@ -148,6 +153,7 @@ func main() {
 	mgr := peer.NewManager(peer.Config{
 		NetworkMagic:   magic,
 		ListenAddr:     cfg.ListenAddr,
+		AdvertiseAddr:  cfg.AdvertiseAddr,
 		StaticPeers:    cfg.StaticPeers,
 		MaxInbound:     cfg.MaxInbound,
 		MaxOutbound:    cfg.MaxOutbound,

@@ -37,6 +37,7 @@ type ConnInfo struct {
 type Config struct {
 	NetworkMagic   uint32
 	ListenAddr     string
+	AdvertiseAddr  string   // public host:port to include in PeerSharing responses (e.g. "1.2.3.4:3001")
 	StaticPeers    []string // host:port of peers to always connect to
 	MaxInbound     int      // max simultaneous inbound connections (0 = unlimited)
 	MaxOutbound    int      // max simultaneous outbound connections
@@ -358,11 +359,30 @@ func (m *Manager) onNewPeers(peers []protocol.PeerAddress) {
 }
 
 // getShareablePeers returns peer addresses suitable for sharing with others.
+// It includes our own public advertise address (if configured) so that other
+// nodes that ask us for peers can discover and connect back to us.
 func (m *Manager) getShareablePeers() []protocol.PeerAddress {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var result []protocol.PeerAddress
+
+	// Include our own advertise address first so we appear in peer lists.
+	// This is the primary mechanism for new nodes to discover us: the nodes
+	// we connect to (outbound) may share our address with their own peers.
+	if m.cfg.AdvertiseAddr != "" {
+		host, portStr, err := net.SplitHostPort(m.cfg.AdvertiseAddr)
+		if err == nil {
+			if ip := net.ParseIP(host); ip != nil {
+				var port uint16
+				fmt.Sscanf(portStr, "%d", &port)
+				if port > 0 {
+					result = append(result, protocol.PeerAddress{IP: ip, Port: port})
+				}
+			}
+		}
+	}
+
 	for _, s := range m.peers {
 		if s.info.Direction != DirOutbound {
 			continue

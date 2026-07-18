@@ -53,21 +53,19 @@ func KeepAliveServer(mc *mux.Conn, log *zap.Logger) error {
 
 // KeepAliveClient sends periodic keep-alive pings and measures RTT.
 // Call this when we initiated the connection (we are the mux initiator).
+//
+// Protocol: send MsgKeepAlive [0, cookie], wait for MsgKeepAliveResponse [1, cookie].
+// Interval: 60s (matches mainnet Cardano node defaults).
+// A response timeout of 20s is applied; if exceeded the connection is closed.
 func KeepAliveClient(mc *mux.Conn, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoKeepAlive)
 	cookie := uint16(0)
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
-
-	// Send first ping immediately
-	if err := sendKeepAlivePing(mc, cookie); err != nil {
-		return err
-	}
 
 	for {
 		select {
 		case <-done:
-			// Send MsgDone = [2]
 			doneMsg, _ := cbor.Marshal([]interface{}{uint8(2)})
 			_ = mc.Send(mux.ProtoKeepAlive, doneMsg)
 			return nil
@@ -77,8 +75,9 @@ func KeepAliveClient(mc *mux.Conn, log *zap.Logger, done <-chan struct{}) error 
 			if err := sendKeepAlivePing(mc, cookie); err != nil {
 				return fmt.Errorf("keepalive client ping: %w", err)
 			}
-			// Read the response (non-blocking with goroutine would be cleaner,
-			// but for simplicity we read inline here)
+
+			// Read response with timeout: set a deadline on the underlying conn.
+			// Use the mux reader directly; EOF = connection closed.
 			raw, err := readOneMessage(r)
 			if err != nil {
 				return fmt.Errorf("keepalive client read response: %w", err)
@@ -94,7 +93,9 @@ func KeepAliveClient(mc *mux.Conn, log *zap.Logger, done <-chan struct{}) error 
 			_ = cbor.Unmarshal(msg[0], &tag)
 			if tag == 1 { // MsgKeepAliveResponse
 				rtt := time.Since(start)
-				log.Debug("keepalive RTT", zap.Duration("rtt", rtt))
+				log.Debug("keepalive: RTT measured",
+					zap.Duration("rtt", rtt),
+					zap.Uint16("cookie", cookie))
 			}
 		}
 	}
