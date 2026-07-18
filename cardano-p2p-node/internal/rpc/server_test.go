@@ -33,13 +33,17 @@ func (m *mockConns) Stats() (int, int) {
 	return in, out
 }
 
-// mockPool implements rpc.PoolSource.
+// mockPool implements rpc.PoolWriter.
 type mockPool struct {
 	txs []*mempool.TxEntry
 }
 
 func (m *mockPool) GetAll() []*mempool.TxEntry { return m.txs }
 func (m *mockPool) Size() int                  { return len(m.txs) }
+func (m *mockPool) Add(e *mempool.TxEntry) bool {
+	m.txs = append(m.txs, e)
+	return true
+}
 
 func freePort(t *testing.T) string {
 	t.Helper()

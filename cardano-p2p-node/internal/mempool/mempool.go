@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+
+	"github.com/cardano-p2p-node/internal/cardano"
 )
 
 // TxID uniquely identifies a transaction.
@@ -19,8 +21,9 @@ type TxEntry struct {
 	ID          TxID
 	Size        uint32
 	Raw         cbor.RawMessage
-	ReceivedAt  time.Time // when we added this tx (UTC)
-	FromPeer    string    // remote addr of the peer that provided this tx
+	ReceivedAt  time.Time          // when we added this tx (UTC)
+	FromPeer    string             // remote addr of the peer that provided this tx
+	Parsed      *cardano.ParsedTx  // decoded transaction fields; nil if unparseable
 }
 
 // Mempool is a thread-safe in-memory transaction pool.
@@ -70,6 +73,10 @@ func (m *Mempool) Add(entry *TxEntry) bool {
 	}
 	if entry.ReceivedAt.IsZero() {
 		entry.ReceivedAt = time.Now().UTC()
+	}
+	// Parse CBOR fields if not already done
+	if entry.Parsed == nil && len(entry.Raw) > 0 {
+		entry.Parsed = cardano.Parse(entry.Raw)
 	}
 
 	// Evict oldest if at capacity

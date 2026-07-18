@@ -167,11 +167,40 @@ type mempoolResponse struct {
 }
 
 type txOut struct {
-	TxID        string `json:"txid"`
-	SizeBytes   uint32 `json:"size_bytes"`
-	FromPeer    string `json:"from_peer"`
-	ReceivedAt  string `json:"received_at"` // UTC+8 RFC3339
-	RawHex      string `json:"raw_hex"`     // full CBOR as hex
+	TxID       string `json:"txid"`
+	SizeBytes  uint32 `json:"size_bytes"`
+	FromPeer   string `json:"from_peer"`
+	ReceivedAt string `json:"received_at"` // UTC+8 RFC3339
+	RawHex     string `json:"raw_hex"`     // full CBOR as hex
+
+	// Parsed transaction fields (nil if the tx CBOR could not be decoded)
+	Parsed *parsedTxOut `json:"parsed,omitempty"`
+}
+
+// parsedTxOut is the JSON-serialisable view of cardano.ParsedTx.
+type parsedTxOut struct {
+	TxType        string  `json:"tx_type"`
+	InputCount    int     `json:"input_count"`
+	OutputCount   int     `json:"output_count"`
+	FeeLovelace   uint64  `json:"fee_lovelace"`
+	FeeADA        float64 `json:"fee_ada"`
+	TTL           *uint64 `json:"ttl,omitempty"`
+	ValidityStart *uint64 `json:"validity_start,omitempty"`
+	IsContract    bool    `json:"is_contract"`
+	IsValid       *bool   `json:"is_valid,omitempty"`
+
+	HasCerts       bool `json:"has_certs"`
+	HasWithdrawals bool `json:"has_withdrawals"`
+	HasMint        bool `json:"has_mint"`
+	HasCollateral  bool `json:"has_collateral"`
+	HasRefInputs   bool `json:"has_ref_inputs"`
+	HasGovernance  bool `json:"has_governance"`
+
+	NativeScripts   int `json:"native_scripts"`
+	PlutusV1Scripts int `json:"plutus_v1_scripts"`
+	PlutusV2Scripts int `json:"plutus_v2_scripts"`
+	PlutusV3Scripts int `json:"plutus_v3_scripts"`
+	Redeemers       int `json:"redeemers"`
 }
 
 func (s *Server) handleMempool(w http.ResponseWriter, r *http.Request) {
@@ -182,13 +211,38 @@ func (s *Server) handleMempool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, e := range all {
-		out.Transactions = append(out.Transactions, txOut{
+		tx := txOut{
 			TxID:       e.ID.String(),
 			SizeBytes:  e.Size,
 			FromPeer:   e.FromPeer,
 			ReceivedAt: e.ReceivedAt.In(jst).Format(time.RFC3339),
 			RawHex:     hex.EncodeToString(e.Raw),
-		})
+		}
+		if p := e.Parsed; p != nil {
+			tx.Parsed = &parsedTxOut{
+				TxType:          string(p.TxType),
+				InputCount:      p.InputCount,
+				OutputCount:     p.OutputCount,
+				FeeLovelace:     p.Fee,
+				FeeADA:          float64(p.Fee) / 1_000_000,
+				TTL:             p.TTL,
+				ValidityStart:   p.ValidityStart,
+				IsContract:      p.IsContract,
+				IsValid:         p.IsValid,
+				HasCerts:        p.HasCerts,
+				HasWithdrawals:  p.HasWithdrawals,
+				HasMint:         p.HasMint,
+				HasCollateral:   p.HasCollateral,
+				HasRefInputs:    p.HasRefInputs,
+				HasGovernance:   p.HasGovernance,
+				NativeScripts:   p.NativeScripts,
+				PlutusV1Scripts: p.PlutusV1Scripts,
+				PlutusV2Scripts: p.PlutusV2Scripts,
+				PlutusV3Scripts: p.PlutusV3Scripts,
+				Redeemers:       p.Redeemers,
+			}
+		}
+		out.Transactions = append(out.Transactions, tx)
 	}
 
 	writeJSON(w, out)
@@ -226,30 +280,101 @@ func (s *Server) handleDebugInject(w http.ResponseWriter, r *http.Request) {
 
 	var injected []string
 	for i := 0; i < count; i++ {
-		// Random 32-byte txid
 		txid := make([]byte, 32)
 		if _, err := rand.Read(txid); err != nil {
 			http.Error(w, "rand failed", http.StatusInternalServerError)
 			return
 		}
 
-		// Minimal fake Cardano-ish transaction body as CBOR:
-		// A map with a few fields that look plausible
-		fakeTx, _ := cbor.Marshal(map[interface{}]interface{}{
-			0: []interface{}{ // inputs (empty)
-			},
-			1: []interface{}{ // outputs (empty)
-			},
-			2: i * 1000000, // fee in lovelace (fake)
-			// tag the tx with an index so each is unique
-			999: fmt.Sprintf("test-tx-%d-%s", i, hex.EncodeToString(txid[:4])),
+		// Construct a fake transaction as a proper 4-element CBOR array
+		// [transaction_body, witness_set, is_valid, null]
+		// so that our parser can extract meaningful fields.
+
+		// Fake input = [tx_hash_bytes, index]
+		inputHash := make([]byte, 32)
+		rand.Read(inputHash)
+		fakeInput := []interface{}{inputHash, 0}
+
+		// Fake output address (29 bytes enterprise addr tag)
+		fakeAddr := make([]byte, 29)
+		rand.Read(fakeAddr)
+		fakeAddr[0] = 0x61 // mainnet enterprise addr tag
+
+		// Alternate between tx types to cover all cases
+		fee := uint64(170000 + i*10000) // realistic fee range
+
+		var body map[interface{}]interface{}
+		switch i % 4 {
+		case 0: // simple transfer
+			body = map[interface{}]interface{}{
+				0: []interface{}{fakeInput},
+				1: []interface{}{[]interface{}{fakeAddr, 2_000_000}},
+				2: fee,
+				3: uint64(100_000_000 + i), // TTL
+			}
+
+		case 1: // native script (multi-sig)
+			body = map[interface{}]interface{}{
+				0: []interface{}{fakeInput},
+				1: []interface{}{[]interface{}{fakeAddr, 5_000_000}},
+				2: fee,
+			}
+
+		case 2: // Plutus contract call
+			scriptHash := make([]byte, 32)
+			rand.Read(scriptHash)
+			body = map[interface{}]interface{}{
+				0:  []interface{}{fakeInput},
+				1:  []interface{}{[]interface{}{fakeAddr, 10_000_000}},
+				2:  fee,
+				11: scriptHash, // script_data_hash → IsContract=true
+				13: []interface{}{[]interface{}{inputHash, 1}}, // collateral
+			}
+
+		case 3: // minting + governance
+			body = map[interface{}]interface{}{
+				0:  []interface{}{fakeInput, []interface{}{inputHash, 2}},
+				1:  []interface{}{[]interface{}{fakeAddr, 3_000_000}},
+				2:  fee,
+				9:  map[interface{}]interface{}{"policy1": 1000}, // mint
+				19: []interface{}{}, // governance (voting_procedures)
+			}
+		}
+
+		bodyBytes, _ := cbor.Marshal(body)
+
+		// Witness set
+		var witnessMap map[interface{}]interface{}
+		switch i % 4 {
+		case 1: // native script witness
+			witnessMap = map[interface{}]interface{}{
+				1: []interface{}{[]interface{}{0, []interface{}{}}}, // native_script
+			}
+		case 2: // Plutus V2 witness
+			scriptBytes := make([]byte, 64)
+			rand.Read(scriptBytes)
+			witnessMap = map[interface{}]interface{}{
+				5: []interface{}{[]interface{}{0, 0, []interface{}{}, 1}}, // redeemer
+				6: []interface{}{scriptBytes}, // plutus_v2_script
+			}
+		default:
+			witnessMap = map[interface{}]interface{}{}
+		}
+		witnessBytes, _ := cbor.Marshal(witnessMap)
+
+		// Full transaction: [body, witness_set, is_valid, null]
+		fullTx, _ := cbor.Marshal([]interface{}{
+			cbor.RawMessage(bodyBytes),
+			cbor.RawMessage(witnessBytes),
+			true,
+			nil,
 		})
 
 		entry := &mempool.TxEntry{
 			ID:         mempool.TxID(txid),
-			Size:       uint32(len(fakeTx)),
-			Raw:        cbor.RawMessage(fakeTx),
-			FromPeer:   "debug/inject",
+			Size:       uint32(len(fullTx)),
+			Raw:        cbor.RawMessage(fullTx),
+			FromPeer:   fmt.Sprintf("debug/inject (type=%s)", txTypeLabel(i)),
 			ReceivedAt: time.Now().UTC(),
 		}
 		if s.pool.Add(entry) {
@@ -261,6 +386,21 @@ func (s *Server) handleDebugInject(w http.ResponseWriter, r *http.Request) {
 		Injected: len(injected),
 		TxIDs:    injected,
 	})
+}
+
+func txTypeLabel(i int) string {
+	switch i % 4 {
+	case 0:
+		return "simple"
+	case 1:
+		return "native-script"
+	case 2:
+		return "plutus-v2"
+	case 3:
+		return "mint+governance"
+	default:
+		return "unknown"
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
