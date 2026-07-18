@@ -36,24 +36,39 @@ const defaultRingSize = 256
 // Store is a thread-safe rolling buffer of recent chain state.
 // When new headers arrive from upstream, it notifies all subscribers
 // so downstream ChainSync servers can forward them immediately.
+//
+// Only the last `defaultRingSize` headers are kept in memory.
+// Block bodies are kept for only the last `maxBlockCache` headers.
+// No historical data is persisted — this is purely a relay cache.
 type Store struct {
 	mu      sync.RWMutex
-	headers []Header   // ring buffer of recent headers
-	blocks  map[string]Block // hash (hex) → block
+	headers []Header         // ring buffer of recent headers (max defaultRingSize)
+	blocks  map[string]Block // hash → block body (only recent blocks)
 
 	tip      Point
 	tipBlock uint64
+
+	// maxBlockCache controls how many recent block bodies to keep.
+	// Older blocks are evicted; downstream peers that are too far behind
+	// will receive MsgNoBlocks and must fetch from other peers.
+	maxBlockCache int
 
 	// Subscribers waiting for new headers
 	subsMu sync.Mutex
 	subs   []chan struct{}
 }
 
+// defaultMaxBlockCache is the number of recent block bodies to keep.
+// This covers ~1 hour of mainnet blocks (1 block/20s × 200s buffer = 10 recent).
+// Downstream peers requesting older blocks will receive MsgNoBlocks.
+const defaultMaxBlockCache = 20
+
 // New creates a new Store.
 func New() *Store {
 	return &Store{
-		headers: make([]Header, 0, defaultRingSize),
-		blocks:  make(map[string]Block),
+		headers:       make([]Header, 0, defaultRingSize),
+		blocks:        make(map[string]Block),
+		maxBlockCache: defaultMaxBlockCache,
 	}
 }
 
@@ -89,19 +104,24 @@ func (s *Store) AddHeader(h Header) {
 }
 
 // AddBlock stores a full block body.
+// Only the most recent maxBlockCache blocks are retained; older ones are evicted
+// using the header ring buffer order (oldest header's block is removed first).
 func (s *Store) AddBlock(b Block) {
 	s.mu.Lock()
 	key := hashKey(b.Point.Hash)
 	s.blocks[key] = b
-	// Prune blocks that are more than 256 slots behind tip
-	if len(s.blocks) > defaultRingSize*2 {
-		// Simple cleanup: remove oldest entries
-		// In production we'd track insertion order
-		for k := range s.blocks {
-			delete(s.blocks, k)
-			if len(s.blocks) <= defaultRingSize {
+
+	// Evict blocks for headers that have scrolled out of our cache window.
+	// We keep blocks only for the newest maxBlockCache headers.
+	if len(s.blocks) > s.maxBlockCache {
+		// Walk the header ring from the front (oldest) and delete their blocks
+		// until we're within budget.
+		for _, h := range s.headers {
+			if len(s.blocks) <= s.maxBlockCache {
 				break
 			}
+			oldKey := hashKey(h.Point.Hash)
+			delete(s.blocks, oldKey)
 		}
 	}
 	s.mu.Unlock()

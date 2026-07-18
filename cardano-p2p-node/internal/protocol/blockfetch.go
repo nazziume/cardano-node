@@ -21,8 +21,16 @@ const (
 	bfTagBatchDone    = 5
 )
 
-// BlockFetchClient downloads blocks for headers in the store.
-// It connects to an upstream node and pulls blocks for recent headers.
+// recentBlockWindow is the number of recent block bodies to proactively fetch.
+// Older blocks are not fetched because:
+// 1. Downstream peers that are very far behind are unlikely (churn replaces them).
+// 2. Fetching too many old blocks wastes upstream bandwidth.
+// 3. The fetchyness metric only matters for the MOST RECENT blocks per slot.
+const recentBlockWindow = 10
+
+// BlockFetchClient downloads blocks for the most recent headers in the store.
+// It does NOT download historical blocks — only the latest recentBlockWindow blocks
+// are fetched so they can be served immediately to downstream peers.
 func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoBlockFetch)
 	newHeaderCh := store.Subscribe()
@@ -35,10 +43,17 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-
 		case <-newHeaderCh:
 		}
 
-		// Get headers we don't have blocks for yet
+		// Only fetch blocks for the most recent recentBlockWindow headers.
+		// This avoids downloading the entire blockchain history.
 		headers := store.AllHeaders()
+		start := 0
+		if len(headers) > recentBlockWindow {
+			start = len(headers) - recentBlockWindow
+		}
+		recentHeaders := headers[start:]
+
 		var toFetch []chain.Header
-		for _, h := range headers {
+		for _, h := range recentHeaders {
 			if _, ok := store.GetBlock(h.Point.Hash); !ok {
 				toFetch = append(toFetch, h)
 			}
@@ -47,9 +62,6 @@ func BlockFetchClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-
 			continue
 		}
 
-		// Fetch blocks for headers we're missing
-		// Request one range at a time (from → to point)
-		// For simplicity, fetch each block individually
 		for _, h := range toFetch {
 			select {
 			case <-done:

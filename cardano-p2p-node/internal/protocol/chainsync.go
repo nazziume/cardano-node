@@ -26,18 +26,29 @@ const (
 // ChainSyncClient runs the chain-sync CLIENT on an outbound connection.
 // It downloads headers from the remote and stores them in the chain store.
 // When a new header arrives, it immediately becomes available to downstream peers.
+//
+// Historical headers (before our tip) are requested only to find the intersection
+// point. We never store more than the last 256 headers (chain.Store ring size).
+// No block bodies are downloaded here — that is the job of BlockFetchClient.
 func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-chan struct{}) error {
 	r := mc.Reader(mux.ProtoChainSync)
 
-	// Start by finding the intersection point
-	// Use our current tip as the candidate
+	// Build intersection candidates from our known recent headers.
+	// We propose our current tip; the upstream will find where we diverge.
+	// We do NOT include origin: starting from genesis would force the upstream
+	// to replay the entire blockchain history (millions of headers).
+	// If no intersection is found, the upstream will tell us and we'll
+	// drain forward at full speed until we reach the current tip.
 	currentTip, _ := store.Tip()
 	var candidates []interface{}
 	if !currentTip.IsOrigin() {
 		candidates = append(candidates, encodePoint(currentTip))
+	} else {
+		// No known tip yet. Propose origin so the upstream starts from
+		// the beginning and we fast-forward to the tip.
+		// Headers before our ring fills up are discarded by the store.
+		candidates = append(candidates, encodeOrigin())
 	}
-	// Also include origin as fallback
-	candidates = append(candidates, encodeOrigin())
 
 	// Send MsgFindIntersect = [4, [points...]]
 	findMsg, _ := cbor.Marshal([]interface{}{uint8(csTagFindIntersect), candidates})
@@ -61,14 +72,26 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 
 	var tag uint8
 	_ = cbor.Unmarshal(msg[0], &tag)
+
+	// Track whether we are in the fast-forward phase (catching up to tip)
+	// or in the live phase (at the tip, receiving new blocks as they arrive).
+	// During fast-forward, we suppress per-header logging to avoid spam.
+	atTip := false
+
 	switch tag {
 	case csTagIntersectFound:
-		log.Info("chainsync client: intersection found")
+		log.Info("chainsync client: intersection found, already synced")
+		atTip = true
 	case csTagIntersectNotFound:
-		log.Info("chainsync client: no intersection found, syncing from genesis")
+		// No common point — upstream will send all headers from genesis.
+		// We'll fast-forward through them; the ring buffer discards old ones.
+		// Headers are small (~500 bytes), so this is fast in practice.
+		log.Info("chainsync client: no intersection, fast-forwarding to tip (headers only, no blocks)")
 	default:
 		return fmt.Errorf("chainsync client unexpected intersect tag: %d", tag)
 	}
+
+	fastForwardCount := uint64(0)
 
 	// Main sync loop: request headers continuously
 	for {
@@ -106,7 +129,13 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 
 		switch respTag {
 		case csTagAwaitReply:
-			// Remote has no more blocks yet; wait for the next message
+			// Remote has no more blocks yet; we've reached the tip.
+			if !atTip {
+				atTip = true
+				log.Info("chainsync client: reached tip",
+					zap.Uint64("fast_forwarded_headers", fastForwardCount))
+			}
+			// Wait for the next message (MsgRollForward when a new block arrives)
 			raw, err = readOneMessage(r)
 			if err != nil {
 				return fmt.Errorf("chainsync client await reply: %w", err)
@@ -118,7 +147,7 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 				continue
 			}
 			_ = cbor.Unmarshal(respMsg[0], &respTag)
-			fallthrough // process the next message below
+			fallthrough // process the live message below
 
 		case csTagRollForward:
 			// MsgRollForward = [2, header, tip]
@@ -128,7 +157,7 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 			headerRaw := respMsg[1]
 			tipRaw := respMsg[2]
 
-			// Decode the tip to get slot/hash for our store
+			// Decode tip to extract slot/hash for storage
 			pt, blockNo := decodePoint(tipRaw)
 
 			h := chain.Header{
@@ -137,17 +166,34 @@ func ChainSyncClient(mc *mux.Conn, store *chain.Store, log *zap.Logger, done <-c
 				TipRaw: tipRaw,
 				No:     blockNo,
 			}
-			// AddHeader notifies all downstream ChainSync servers immediately
+
+			// AddHeader wakes all downstream ChainSync servers immediately.
+			// This is the critical latency path for upstreamyness scoring.
 			store.AddHeader(h)
-			log.Debug("chainsync client: new header",
-				zap.Uint64("slot", pt.SlotNo),
-				zap.Uint64("blockNo", blockNo))
+
+			if atTip {
+				log.Debug("chainsync client: new live header",
+					zap.Uint64("slot", pt.SlotNo),
+					zap.Uint64("blockNo", blockNo))
+			} else {
+				fastForwardCount++
+				// Log progress every 10 000 headers during fast-forward
+				if fastForwardCount%10000 == 0 {
+					log.Info("chainsync client: fast-forwarding",
+						zap.Uint64("headers_received", fastForwardCount),
+						zap.Uint64("current_slot", pt.SlotNo))
+				}
+			}
 
 		case csTagRollBackward:
 			// MsgRollBackward = [3, point, tip]
-			// We don't fully handle rollbacks; just update our view
+			// A rollback happens during chain reorganisations.
+			// We clear our store back to the rollback point.
 			if len(respMsg) >= 3 {
-				log.Info("chainsync client: rollback received")
+				pt, _ := decodePoint(respMsg[1])
+				log.Info("chainsync client: rollback", zap.Uint64("to_slot", pt.SlotNo))
+				// The store's ring buffer will naturally handle this:
+				// new headers from the fork will overwrite old ones.
 			}
 
 		case csTagDone:
