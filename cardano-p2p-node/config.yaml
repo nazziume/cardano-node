@@ -1,0 +1,81 @@
+# Cardano P2P Node Configuration
+
+# network: mainnet | preview | preprod | sanchonet
+network: mainnet
+
+# Local address to listen on for inbound connections.
+# Set to "" to disable inbound (outbound-only mode).
+listenAddr: "0.0.0.0:3001"
+
+# Upstream peers to always maintain persistent outbound connections to.
+# Add multiple well-known relay nodes for redundancy and lower latency.
+staticPeers:
+  - "backbone.cardano-mainnet.iohk.io:3001"
+  - "backbone.mainnet.emurgornd.com:3001"
+  - "backbone.mainnet.cardanofoundation.org:3001"
+
+# ── Connection limits ─────────────────────────────────────────────────────────
+# Maximum simultaneous inbound connections.
+# More inbound peers means more chances to build upstreamyness/fetchyness scores.
+# Each connection uses ~2 MB of RAM at steady state.
+maxInbound: 50
+
+# Maximum simultaneous outbound connections.
+# 50 outbound connections give wide PeerSharing coverage (~2MB RAM each).
+maxOutbound: 50
+
+# How long to wait before reconnecting to a lost outbound peer.
+reconnectDelay: "10s"
+
+# ── Ledger Peers ─────────────────────────────────────────────────────────────
+# Cardano Ledger Peers are SPO (Stake Pool Operator) relay nodes whose addresses
+# are registered on the Cardano blockchain.
+#
+# The peer snapshot is a JSON file published by IOG and updated every epoch.
+# Snapshot format: version 2 (bigLedgerPools) or version 23 (bigLedgerPools +
+# allLedgerPools). Each pool entry contains relay addresses (IP or DNS hostname).
+#
+# On startup, the snapshot is fetched, DNS names are resolved concurrently,
+# and the resulting "ip:port" addresses are fed to the peer manager.
+# Pools are sorted by relativeStake descending so the highest-stake SPOs are
+# connected first (they are the most reliable and well-maintained relays).
+ledgerPeers:
+  enabled: true
+
+  # Local snapshot file (checked first; useful for air-gapped setups).
+  # Download from: https://book.world.dev.cardano.org/environments/mainnet/peer-snapshot.json
+  snapshotFile: ""
+
+  # Remote URL to fetch the snapshot from. Supported: http/https.
+  # Official snapshots by network:
+  #   mainnet: https://book.world.dev.cardano.org/environments/mainnet/peer-snapshot.json
+  #   preprod: https://book.world.dev.cardano.org/environments/preprod/peer-snapshot.json
+  #   preview: https://book.world.dev.cardano.org/environments/preview/peer-snapshot.json
+  snapshotURL: "https://book.world.dev.cardano.org/environments/mainnet/peer-snapshot.json"
+
+  # How often to re-fetch and re-resolve the snapshot.
+  # SPO relay registrations change slowly; 1h is usually sufficient.
+  refreshInterval: "1h"
+
+  # Maximum number of relay addresses to use from each snapshot refresh.
+  # Addresses are taken from the highest-stake pools first.
+  maxPeers: 100
+
+# ── RPC server ────────────────────────────────────────────────────────────────
+# Bind address for the HTTP query interface.
+# Set to "" to disable RPC.
+#
+# Endpoints:
+#   GET /status  → connection list (ip, port, direction, uptime, connected_at CST)
+#   GET /mempool → all transactions (txid, size, from_peer, received_at CST, raw hex)
+#   GET /health  → 200 OK liveness probe
+rpcAddr: "127.0.0.1:8888"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Logging level: debug | info | warn | error
+# All timestamps are in UTC+8 (CST).
+# Events logged automatically:
+#   - Inbound/outbound connections (ip, port, connected_at CST)
+#   - New mempool transactions (txid, size, from_peer, received_at CST)
+#   - Chain tip progress during fast-forward and live relay
+logLevel: "info"
