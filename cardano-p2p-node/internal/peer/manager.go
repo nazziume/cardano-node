@@ -45,6 +45,22 @@ type Config struct {
 	ReconnectDelay time.Duration
 }
 
+// maxKnownAddrs caps the total known address set. PeerSharing can return
+// thousands of addresses (including bad ones with ephemeral ports). Without
+// a cap, each address spawns a connectLoop goroutine that eventually acquires
+// an outbound slot, starving legitimate peers.
+const maxKnownAddrs = 500
+
+// maxAddrsPerIP limits how many distinct ports we track per IP address.
+// Some nodes behind NAT share their ephemeral connection ports via PeerSharing
+// instead of their listen port. Without this limit, a single bad IP can fill
+// the entire knownAddrs set with hundreds of useless addresses.
+const maxAddrsPerIP = 3
+
+// maxConnectFailures is how many consecutive permanent-error failures
+// (timeout, unreachable, DNS) before we stop retrying an address forever.
+const maxConnectFailures = 3
+
 // Manager manages all peer connections.
 type Manager struct {
 	cfg   Config
@@ -59,6 +75,7 @@ type Manager struct {
 	mu         sync.RWMutex
 	peers      map[string]*connState // addr → state
 	knownAddrs map[string]bool
+	addrsByIP  map[string]int // ip → count of addresses tracked
 
 	// Semaphore channels for connection limits
 	inboundSem  chan struct{} // capacity = MaxInbound
@@ -90,6 +107,7 @@ func NewManager(cfg Config, store *chain.Store, pool *mempool.Mempool, log *zap.
 		log:         log,
 		peers:       make(map[string]*connState),
 		knownAddrs:  make(map[string]bool),
+		addrsByIP:   make(map[string]int),
 		inboundSem:  make(chan struct{}, cfg.MaxInbound),
 		outboundSem: make(chan struct{}, cfg.MaxOutbound),
 	}
@@ -118,17 +136,32 @@ func (m *Manager) Run(ctx context.Context) error {
 	return nil
 }
 
-// AddDynamicPeers is called by the ledger peer manager (and peer sharing) to
-// register newly discovered addresses. For each address that is not already
-// known, a connectLoop goroutine is spawned so we connect when a slot is free.
+// AddDynamicPeers registers newly discovered addresses and spawns connectLoop
+// goroutines for each new one, subject to the following guards:
+//   - Global cap: stop adding when knownAddrs reaches maxKnownAddrs (500).
+//   - Per-IP cap: at most maxAddrsPerIP (3) addresses per IP address.
+//     This prevents a single bad node from flooding the set with hundreds
+//     of ephemeral ports (99.1.168.192:6000, :6001, :9011, :62312…).
 func (m *Manager) AddDynamicPeers(ctx context.Context, addrs []string) {
 	m.mu.Lock()
 	var fresh []string
 	for _, addr := range addrs {
-		if !m.knownAddrs[addr] {
-			m.knownAddrs[addr] = true
-			fresh = append(fresh, addr)
+		if m.knownAddrs[addr] {
+			continue
 		}
+		if len(m.knownAddrs) >= maxKnownAddrs {
+			break // global cap reached
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			continue
+		}
+		if m.addrsByIP[host] >= maxAddrsPerIP {
+			continue // per-IP cap
+		}
+		m.knownAddrs[addr] = true
+		m.addrsByIP[host]++
+		fresh = append(fresh, addr)
 	}
 	m.mu.Unlock()
 
@@ -264,9 +297,9 @@ func isPermanentDialError(err error) bool {
 		strings.Contains(s, "i/o timeout")
 }
 
-// connectLoop maintains a persistent outbound connection to addr,
-// reconnecting on failure with back-off up to ReconnectDelay.
-// IPv6 addresses are skipped entirely when the host has no IPv6 routing.
+// connectLoop maintains a persistent outbound connection to addr.
+// Exits permanently after maxConnectFailures (3) consecutive permanent-error
+// failures so the goroutine doesn't run forever on a dead address.
 func (m *Manager) connectLoop(ctx context.Context, addr string) {
 	delay := m.cfg.ReconnectDelay
 	if delay == 0 {
@@ -274,7 +307,6 @@ func (m *Manager) connectLoop(ctx context.Context, addr string) {
 	}
 
 	// Skip IPv6 addresses if the machine has no IPv6 connectivity.
-	// Attempting them repeatedly just wastes outbound slots and logs noise.
 	if isIPv6Addr(addr) {
 		conn, err := net.DialTimeout("tcp6", addr, 3*time.Second)
 		if err != nil && strings.Contains(err.Error(), "network is unreachable") {
@@ -286,6 +318,8 @@ func (m *Manager) connectLoop(ctx context.Context, addr string) {
 		}
 	}
 
+	consecutivePermFail := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -293,7 +327,7 @@ func (m *Manager) connectLoop(ctx context.Context, addr string) {
 		default:
 		}
 
-		// Acquire outbound slot (blocking — waits if we're at the limit).
+		// Acquire outbound slot (blocking).
 		select {
 		case m.outboundSem <- struct{}{}:
 		case <-ctx.Done():
@@ -309,17 +343,25 @@ func (m *Manager) connectLoop(ctx context.Context, addr string) {
 
 		<-m.outboundSem // release slot before sleeping
 
-		// Use a longer back-off for permanent errors (DNS, IPv6 unreachable)
-		// so we don't retry every 10s forever.
-		retryDelay := delay
 		if err != nil && isPermanentDialError(err) {
-			retryDelay = 5 * time.Minute
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(retryDelay):
+			consecutivePermFail++
+			if consecutivePermFail >= maxConnectFailures {
+				m.log.Debug("connectLoop: giving up after repeated failures",
+					zap.String("addr", addr), zap.Int("failures", consecutivePermFail))
+				return // goroutine exits permanently
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Minute):
+			}
+		} else {
+			consecutivePermFail = 0 // reset on success or transient error
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
 		}
 	}
 }
